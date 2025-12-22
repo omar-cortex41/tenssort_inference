@@ -101,9 +101,7 @@ trtexec \
 
 ```
 ├── main.py          # TensorRT inference (fast, no PyTorch)
-├── yolo.py          # Ultralytics inference (simple, slower)
 ├── pt_to_onnx.py    # Convert .pt to .onnx
-├── coco.names       # 80 COCO class names
 ├── yolo11n.pt       # YOLO11 nano PyTorch weights
 ├── yolo11n.onnx     # YOLO11 nano ONNX model
 ├── yolo11n.engine   # TensorRT engine (generated)
