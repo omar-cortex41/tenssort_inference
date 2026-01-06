@@ -1,39 +1,40 @@
 #!/usr/bin/env python3
-"""Test script for the C++ TRT detector module."""
+"""TensorRT YOLO Detector - reads config from config/config.yaml"""
 
 import sys
 import time
+import yaml
 sys.path.insert(0, 'trt_detector/build')
 
 import cv2
-import numpy as np
-from trt_detector import DetectorService, ModelConfig, Detection
+from trt_detector import DetectorService, ModelConfig
 
-# Configuration
-VIDEO_PATH = "videos/sg1.mkv"
-ENGINE_PATH = "models/sgm32.engine"
-CLASS_NAMES = ['boots', 'helmet', 'no boots', 'no helmet', 'no vest', 'person', 'vest']
+# Load configuration
+with open('config/config.yaml', 'r') as f:
+    cfg = yaml.safe_load(f)
 
 def main():
     print("Creating DetectorService...")
     detector = DetectorService()
-    
-    print(f"Loading model from {ENGINE_PATH}...")
+
+    engine_path = cfg['model']['engine_path']
+    print(f"Loading model from {engine_path}...")
+
     config = ModelConfig(
-        ENGINE_PATH,
-        CLASS_NAMES,
-        conf_threshold=0.6,
-        nms_threshold=0.45
+        engine_path,
+        cfg['class_names'],
+        conf_threshold=cfg['model']['conf_threshold'],
+        nms_threshold=cfg['model']['nms_threshold']
     )
-    
+
     if not detector.load_model(config):
         print("Failed to load model!")
         return
 
     print("Model loaded successfully!")
-    
+
     # Open video
-    cap = cv2.VideoCapture(VIDEO_PATH)
+    cap = cv2.VideoCapture(cfg['video']['path'])
     if not cap.isOpened():
         print(f"Failed to open video: {VIDEO_PATH}")
         return

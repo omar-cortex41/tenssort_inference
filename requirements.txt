@@ -3,6 +3,7 @@ numpy
 opencv-python
 ultralytics
 pybind11
+pyyaml
 
 # Note: The following must be installed separately (not via pip):
 # - CUDA Toolkit (11.x or 12.x)

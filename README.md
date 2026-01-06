@@ -12,7 +12,29 @@ High-performance YOLO object detection using TensorRT C++ with Python bindings.
 
 ---
 
-## Quick Start
+## Quick Start (Docker) - Recommended
+
+The easiest way to run this project. Requires [Docker](https://docs.docker.com/get-docker/) and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
+
+```bash
+# 1. Place your model and video files
+cp your_model.pt models/
+cp your_video.mp4 videos/
+
+# 2. Edit config
+nano config/config.yaml
+
+# 3. Build and run
+docker compose build
+docker compose run detector ./scripts/build_model.sh models/your_model.pt fp16
+docker compose run detector
+```
+
+That's it! The Docker container handles all dependencies, C++ compilation, and model conversion.
+
+---
+
+## Quick Start (Manual)
 
 ```bash
 # 1. Install Python dependencies
@@ -25,8 +47,11 @@ cmake ..
 make -j$(nproc)
 cd ../..
 
-# 3. Run inference
-python trt_inference.py
+# 3. Build TensorRT engine from your model
+./scripts/build_model.sh models/your_model.pt fp16
+
+# 4. Run inference
+python main.py
 ```
 
 ---
@@ -173,16 +198,22 @@ python yolo.py
 ├── trt_detector/           # C++ TensorRT detector module
 │   ├── include/            # Header files
 │   ├── src/                # Source files (.cpp, .cu)
-│   ├── build/              # Build output (created after cmake/make)
+│   ├── build/              # Build output (after cmake/make)
 │   └── CMakeLists.txt      # CMake build configuration
+├── config/
+│   └── config.yaml         # Model/video/class configuration
 ├── models/                 # Model files
 │   ├── *.pt                # PyTorch weights
 │   ├── *.onnx              # ONNX models
 │   └── *.engine            # TensorRT engines
 ├── videos/                 # Input videos
-├── trt_inference.py        # TensorRT C++ inference script
+├── scripts/
+│   └── build_model.sh      # Model conversion script
+├── main.py                 # TensorRT inference script
 ├── yolo.py                 # Ultralytics YOLO inference script
 ├── pt_to_onnx.py           # PyTorch to ONNX converter
+├── Dockerfile              # Docker build file
+├── docker-compose.yml      # Docker compose config
 ├── requirements.txt        # Python dependencies
 └── README.md               # This file
 ```
@@ -238,3 +269,54 @@ pip install pybind11
 - Close other GPU applications
 - Use a smaller model
 - Reduce input video resolution
+
+---
+
+## Docker Details
+
+### Prerequisites
+
+1. **Docker**: https://docs.docker.com/get-docker/
+2. **NVIDIA Container Toolkit**:
+```bash
+# Add NVIDIA repo
+distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -
+curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | \
+  sudo tee /etc/apt/sources.list.d/nvidia-docker.list
+
+# Install
+sudo apt-get update
+sudo apt-get install -y nvidia-container-toolkit
+sudo systemctl restart docker
+```
+
+### Docker Commands
+
+```bash
+# Build the Docker image
+docker compose build
+
+# Convert model to TensorRT engine
+docker compose run detector ./scripts/build_model.sh models/your_model.pt fp16
+
+# Run inference
+docker compose run detector
+
+# Run with custom command
+docker compose run detector python3 yolo.py
+
+# Interactive shell
+docker compose run detector bash
+```
+
+### Display Issues (GUI)
+
+If the video window doesn't appear:
+```bash
+# Allow Docker to access display
+xhost +local:docker
+
+# Then run
+docker compose run detector
+```
