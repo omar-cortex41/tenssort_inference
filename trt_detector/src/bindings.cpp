@@ -49,10 +49,22 @@ PYBIND11_MODULE(trt_detector, m) {
         .def("load_model", &DetectorService::loadModel)
         .def("unload_model", &DetectorService::unloadModel)
         .def("is_loaded", &DetectorService::isLoaded)
+        .def("get_max_batch_size", &DetectorService::getMaxBatchSize)
         .def("detect", [](DetectorService& self, py::array_t<uint8_t>& frame) {
             cv::Mat mat = numpy_to_mat(frame);
             py::gil_scoped_release release;
             return self.detect(mat);
+        })
+        .def("detect_batch", [](DetectorService& self, py::list frames_list) {
+            // Convert list of numpy arrays to vector of cv::Mat
+            std::vector<cv::Mat> frames;
+            frames.reserve(py::len(frames_list));
+            for (auto item : frames_list) {
+                py::array_t<uint8_t> arr = item.cast<py::array_t<uint8_t>>();
+                frames.push_back(numpy_to_mat(arr));
+            }
+            py::gil_scoped_release release;
+            return self.detectBatch(frames);
         });
 
     // FrameResult for async pipeline

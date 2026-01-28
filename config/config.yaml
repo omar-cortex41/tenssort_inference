@@ -1,0 +1,37 @@
+model:
+  engine_path: models/sgm_fp16.engine
+  conf_threshold: 0.6
+  nms_threshold: 0.45
+video:
+  path: videos/people.mp4
+class_names:
+- boots
+- helmet
+- no boots
+- no helmet
+- no vest
+- person
+- vest
+tracking:
+  track_thresh: 0.5      # Min confidence to start tracking
+  match_thresh: 0.8      # IoU threshold for matching detections to tracks
+  track_buffer: 30       # Frames to keep lost tracks before removing  ///track_buffer / frame_rate = seconds to keep lost tracks
+  track_classes:
+  - person
+  # - no vest
+
+# Multiple camera streams (for multi_stream.py)
+# Each stream gets its own tracker with independent track IDs
+streams:
+  - id: 0
+    source: videos/people.mp4
+    name: Camera 1
+  - id: 1
+    source: videos/sg1.mkv
+    name: Camera 2
+  - id: 2
+    source: videos/sg2.mkv
+    name: Entrance Camera
+  # - id: 3
+  #   source: 0    # Webcam
+  #   name: Webcam

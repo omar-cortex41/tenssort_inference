@@ -32,5 +32,17 @@ std::vector<Detection> DetectorService::detect(const cv::Mat& frame) {
     return engine_->detect(frame);
 }
 
+std::vector<std::vector<Detection>> DetectorService::detectBatch(const std::vector<cv::Mat>& frames) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!engine_) return {};
+    return engine_->detectBatch(frames);
+}
+
+int DetectorService::getMaxBatchSize() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!engine_) return 0;
+    return engine_->getMaxBatchSize();
+}
+
 } // namespace trt_detector
 
