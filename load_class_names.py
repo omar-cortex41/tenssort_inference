@@ -1,4 +1,3 @@
-"
 
 import sys
 import yaml
@@ -6,7 +5,7 @@ from ultralytics import YOLO
 
 
 
-model_path = "models/sgm.pt"
+model_path = "models/yolo26m.pt"
 config_path = "config/config.yaml"
 
 # Load YOLO model

@@ -2,7 +2,7 @@ import subprocess
 import sys
 from sys import argv, exit
 
-model = "models/sgm.pt"
+model = "models/yolo26m.pt"
 
 
 # Convert PyTorch model to ONNX format (runs in separate process to avoid CUDA corruption)

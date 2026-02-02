@@ -37,20 +37,38 @@ That's it! The Docker container handles all dependencies, C++ compilation, and m
 ## Quick Start (Manual)
 
 ```bash
-# 1. Install Python dependencies
+# 1. Install system dependencies
+sudo apt-get update
+sudo apt-get install libopencv-dev pybind11-dev
+
+# 2. Install Python dependencies (including TensorRT)
 pip install -r requirements.txt
 
-# 2. Build the C++ TensorRT module
+# 3. Download TensorRT C++ headers (if not a sudo user)
+# Download TensorRT tar.gz from https://developer.nvidia.com/tensorrt
+# Extract headers to project directory:
+tar -xzf TensorRT-*.tar.gz
+mkdir -p trt_detector/external/tensorrt/include
+cp -r TensorRT-*/include/* trt_detector/external/tensorrt/include/
+
+# 4. Create symlinks for TensorRT libraries
+cd ~/.local/lib/python3.10/site-packages/tensorrt_libs  # or your venv path
+ln -sf libnvinfer.so.10 libnvinfer.so
+ln -sf libnvinfer_plugin.so.10 libnvinfer_plugin.so
+ln -sf libnvonnxparser.so.10 libnvonnxparser.so
+cd -
+
+# 5. Build the C++ TensorRT module
 cd trt_detector
 mkdir -p build && cd build
 cmake ..
 make -j$(nproc)
 cd ../..
 
-# 3. Build TensorRT engine from your model
-./scripts/build_model.sh models/your_model.pt fp16
+# 6. Convert PyTorch model to TensorRT engine
+python pt_to_trt.py --fp16  # or --fp32
 
-# 4. Run inference
+# 7. Run inference
 python main.py
 ```
 
@@ -62,10 +80,40 @@ python main.py
 
 - **OS:** Ubuntu 20.04/22.04 (or similar Linux)
 - **GPU:** NVIDIA GPU with compute capability 7.5+ (RTX 20 series or newer)
-- **CUDA:** 12.x
-- **cuDNN:** 9.x
-- **TensorRT:** 10.x
+  - RTX 3070: compute capability 8.6 ✓
+  - RTX 4090: compute capability 8.9 ✓
 - **Python:** 3.10+
+
+### Tested Configuration (Recommended)
+
+> ⚠️ **IMPORTANT:** All CUDA components must be compatible with each other. Mismatched versions cause runtime errors like `cuTensor permutate failed` or `illegal memory access`.
+
+| Component | Version | Notes |
+|-----------|---------|-------|
+| **NVIDIA Driver** | 570.211.01 | Supports up to CUDA 12.8 |
+| **CUDA Toolkit** | 12.8.61 | Must match driver capability |
+| **cuDNN** | 8.9.7.29+cuda12.2 | Works with CUDA 12.x |
+| **TensorRT** | 10.9.0.34+cuda12.8 | Must match CUDA version |
+
+**Verify your versions:**
+```bash
+# Driver version
+nvidia-smi | grep "Driver Version"
+
+# CUDA version
+nvcc --version
+
+# cuDNN version
+dpkg -l | grep cudnn
+
+# TensorRT version
+dpkg -l | grep nvinfer
+```
+
+**Common version mismatch errors:**
+- `cuTensor permutate failed` → TensorRT/cuDNN built for wrong CUDA version
+- `illegal memory access` → Library version mismatch or buffer overflow
+- `Engine deserialization failed` → Engine built with different TensorRT version
 
 ### Step 1: Install System Dependencies
 
@@ -92,12 +140,74 @@ Download from [NVIDIA cuDNN](https://developer.nvidia.com/cudnn) and follow inst
 
 ### Step 4: Install TensorRT
 
+#### Option A: Via pip (Recommended for non-sudo users)
+
+```bash
+# Install TensorRT Python bindings and libraries
+pip install tensorrt
+
+# Verify installation
+python -c "import tensorrt; print(f'TensorRT version: {tensorrt.__version__}')"
+```
+
+**For C++ development (required for this project):**
+
+1. Download TensorRT tar.gz from [NVIDIA TensorRT Downloads](https://developer.nvidia.com/tensorrt)
+   - Choose the version matching your CUDA version (e.g., TensorRT 10.7 for CUDA 11.x)
+   - Download the tar.gz package (not the .deb)
+
+2. Extract headers to project directory:
+```bash
+# Extract the downloaded tar.gz
+tar -xzf TensorRT-10.7.0.23.Linux.x86_64-gnu.cuda-11.8.tar.gz
+
+# Copy headers to project
+mkdir -p trt_detector/external/tensorrt/include
+cp -r TensorRT-10.7.0.23/include/* trt_detector/external/tensorrt/include/
+```
+
+3. Create symlinks for libraries (pip installs versioned .so files):
+```bash
+# Navigate to tensorrt_libs directory (adjust path for your environment)
+cd ~/.local/lib/python3.10/site-packages/tensorrt_libs
+# or for venv: cd /path/to/venv/lib/python3.10/site-packages/tensorrt_libs
+
+# Create symlinks
+ln -sf libnvinfer.so.10 libnvinfer.so
+ln -sf libnvinfer_plugin.so.10 libnvinfer_plugin.so
+ln -sf libnvonnxparser.so.10 libnvonnxparser.so
+
+# Return to project directory
+cd -
+```
+
+#### Option B: System-wide installation (Requires sudo)
+
 Download from [NVIDIA TensorRT](https://developer.nvidia.com/tensorrt)
+
+After downloading the local repository package (e.g., `nv-tensorrt-local-repo-ubuntu2204-*.deb`), install it:
+
+```bash
+# Install the local repository package
+sudo dpkg -i nv-tensorrt-local-repo-ubuntu2204-*.deb
+
+# Copy the GPG key
+sudo cp /var/nv-tensorrt-local-repo-*/nv-tensorrt-local-*-keyring.gpg /usr/share/keyrings/
+
+# Update package list
+sudo apt-get update
+
+# Install TensorRT
+sudo apt-get install tensorrt
+
+# Verify installation
+dpkg -l | grep tensorrt
+```
 
 After installation, add `trtexec` to your PATH:
 ```bash
 # Find trtexec location
-sudo find / -type f -name trtexec 2>/dev/null
+sudo find /usr -name trtexec 2>/dev/null
 # Usually at: /usr/src/tensorrt/bin/trtexec
 
 # Add to PATH
@@ -126,9 +236,34 @@ cd ../..
 
 This creates `trt_detector/build/trt_detector.cpython-*.so` which Python imports.
 
+**Verify the build:**
+```bash
+# Check the compiled module exists
+ls -lh trt_detector/build/*.so
+
+# Test Python import
+python -c "import sys; sys.path.insert(0, 'trt_detector/build'); import trt_detector; print('✓ Module imported successfully!')"
+```
+
 ### Step 7: Prepare Your Model
 
-#### Convert PyTorch model to ONNX:
+#### Quick Method: Use the conversion script
+
+```bash
+# Convert PyTorch model to TensorRT engine (FP16 - recommended)
+python pt_to_trt.py --fp16
+
+# Or for FP32 (slower but more accurate)
+python pt_to_trt.py --fp32
+```
+
+This script automatically:
+1. Converts `.pt` → `.onnx`
+2. Converts `.onnx` → `.engine` using TensorRT
+
+#### Manual Method: Step-by-step conversion
+
+**Step 1: Convert PyTorch model to ONNX:**
 ```bash
 python pt_to_onnx.py models/your_model.pt
 ```
@@ -140,7 +275,7 @@ model = YOLO("models/your_model.pt")
 model.export(format="onnx")
 ```
 
-#### Convert ONNX to TensorRT Engine:
+**Step 2: Convert ONNX to TensorRT Engine:**
 
 **FP16 (recommended - 2x faster, minimal accuracy loss):**
 ```bash
@@ -158,19 +293,47 @@ trtexec --onnx=models/your_model.onnx --saveEngine=models/your_model_fp32.engine
 
 ## Usage
 
-### TensorRT C++ Inference (Fast)
+### TensorRT C++ Inference with Web Interface (Recommended for SSH)
 
-Edit `trt_inference.py` to set your paths:
-```python
-VIDEO_PATH = "videos/your_video.mp4"
-ENGINE_PATH = "models/your_model.engine"
-CLASS_NAMES = ['class1', 'class2', ...]  # Your model's class names
+The detector now runs as a web service with real-time video streaming, perfect for remote access via SSH.
+
+**1. Configure your model and video:**
+
+Edit `config/config.yaml`:
+```yaml
+model:
+  engine_path: "models/sgm32.engine"
+  conf_threshold: 0.5
+  nms_threshold: 0.45
+
+video:
+  path: "videos/your_video.mp4"
+
+class_names:
+  - "class1"
+  - "class2"
+  # ... your class names
 ```
 
-Run:
+**2. Start the web server:**
 ```bash
-python trt_inference.py
+python detector.py
 ```
+
+**3. Access the interface:**
+- **Local:** Open browser to `http://localhost:8000`
+- **SSH/Remote:**
+  ```bash
+  # On your local machine, create SSH tunnel:
+  ssh -L 8000:localhost:8000 user@remote-server
+
+  # Then open browser to http://localhost:8000
+  ```
+
+The web interface shows:
+- 📹 Real-time video stream with detections
+- 📊 Live statistics (FPS, frame count, processing time)
+- 🎨 Clean dark theme UI
 
 ### Ultralytics YOLO Inference (Reference)
 
@@ -185,9 +348,7 @@ Run:
 python yolo.py
 ```
 
-### Controls
-
-- Press `q` to quit the window
+**Note:** `yolo.py` uses OpenCV display windows which won't work over SSH. Use `detector.py` for remote access.
 
 ---
 
@@ -236,17 +397,56 @@ make -j$(nproc)
 
 TensorRT engines are GPU-specific. Rebuild on your machine:
 ```bash
-trtexec --onnx=models/your_model.onnx --saveEngine=models/your_model.engine --fp16
+python pt_to_trt.py --fp16
+# or manually:
+# trtexec --onnx=models/your_model.onnx --saveEngine=models/your_model.engine --fp16
 ```
 
-### CMake can't find TensorRT
+### CMake can't find TensorRT headers (NvInfer.h)
 
-Set the TensorRT path manually:
+**If you installed via pip (non-sudo):**
+
+1. Download TensorRT tar.gz from NVIDIA
+2. Extract and copy headers:
 ```bash
-export TENSORRT_ROOT=/usr/local/tensorrt  # or your TensorRT location
-cd trt_detector/build
-cmake ..
-make -j$(nproc)
+tar -xzf TensorRT-*.tar.gz
+mkdir -p trt_detector/external/tensorrt/include
+cp -r TensorRT-*/include/* trt_detector/external/tensorrt/include/
+```
+
+**If you have sudo access:**
+```bash
+# Copy headers to system location
+sudo mkdir -p /usr/local/include/tensorrt
+sudo cp -r /path/to/TensorRT-*/include/* /usr/local/include/tensorrt/
+```
+
+### CMake can't find TensorRT libraries (libnvinfer.so)
+
+The pip-installed TensorRT libraries have version suffixes. Create symlinks:
+
+```bash
+# Find your tensorrt_libs directory
+python -c "import tensorrt_libs; import os; print(os.path.dirname(tensorrt_libs.__file__))"
+
+# Navigate there and create symlinks
+cd /path/to/tensorrt_libs  # use the path from above
+ln -sf libnvinfer.so.10 libnvinfer.so
+ln -sf libnvinfer_plugin.so.10 libnvinfer_plugin.so
+ln -sf libnvonnxparser.so.10 libnvonnxparser.so
+```
+
+### CMake can't find OpenCV
+
+Install OpenCV development libraries:
+```bash
+sudo apt-get update
+sudo apt-get install libopencv-dev
+```
+
+Verify installation:
+```bash
+pkg-config --modversion opencv4
 ```
 
 ### CMake can't find pybind11
@@ -257,6 +457,24 @@ sudo apt install pybind11-dev
 # or
 pip install pybind11
 ```
+
+### CUDA architecture mismatch
+
+If you see errors about unsupported compute capability, edit `trt_detector/CMakeLists.txt`:
+
+```cmake
+# Find this line (around line 9):
+set(CMAKE_CUDA_ARCHITECTURES 75 86 89)
+
+# Remove architectures not supported by your CUDA version
+# For CUDA 11.5, remove 89:
+set(CMAKE_CUDA_ARCHITECTURES 75 86)
+```
+
+Common compute capabilities:
+- RTX 20 series (Turing): 75
+- RTX 30 series (Ampere): 86
+- RTX 40 series (Ada Lovelace): 89 (requires CUDA 11.8+)
 
 ### Low FPS
 

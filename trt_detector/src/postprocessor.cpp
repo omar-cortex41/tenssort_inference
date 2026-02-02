@@ -56,57 +56,50 @@ std::vector<Detection> Postprocessor::process(
     int frame_w, int frame_h,
     const std::vector<std::string>& class_names
 ) {
-    std::vector<cv::Rect> boxes;
-    std::vector<float> confidences;
-    std::vector<int> class_ids;
-    
-    for (int i = 0; i < num_detections; ++i) {
-        float cx = raw_output[0 * num_detections + i];
-        float cy = raw_output[1 * num_detections + i];
-        float bw = raw_output[2 * num_detections + i];
-        float bh = raw_output[3 * num_detections + i];
-        
-        float max_score = 0.0f;
-        int max_class = 0;
-        for (int c = 0; c < num_classes; ++c) {
-            float score = raw_output[(4 + c) * num_detections + i];
-            if (score > max_score) {
-                max_score = score;
-                max_class = c;
-            }
-        }
-        
-        if (max_score < conf_threshold) continue;
-        
-        int x1 = static_cast<int>((cx - bw / 2 - pad_x) / scale);
-        int y1 = static_cast<int>((cy - bh / 2 - pad_y) / scale);
-        int w = static_cast<int>(bw / scale);
-        int h = static_cast<int>(bh / scale);
-        
+    std::vector<Detection> detections;
+
+    // Post-NMS format: [num_detections, 6] where each row is [x1, y1, x2, y2, conf, class_id]
+    // num_detections here is actually 6 (the stride), real count is from engine shape
+    // The output is [300, 6] flattened, so we iterate over 300 detections
+    const int stride = 6;  // x1, y1, x2, y2, conf, class_id
+    const int max_dets = 300;  // Ultralytics default max detections
+
+    for (int i = 0; i < max_dets; ++i) {
+        const float* det = raw_output + i * stride;
+
+        float x1_raw = det[0];
+        float y1_raw = det[1];
+        float x2_raw = det[2];
+        float y2_raw = det[3];
+        float conf = det[4];
+        int class_id = static_cast<int>(det[5]);
+
+        // Skip low confidence or invalid detections
+        if (conf < conf_threshold || x2_raw <= x1_raw || y2_raw <= y1_raw) continue;
+
+        // Transform from letterboxed 640x640 back to original frame coordinates
+        int x1 = static_cast<int>((x1_raw - pad_x) / scale);
+        int y1 = static_cast<int>((y1_raw - pad_y) / scale);
+        int x2 = static_cast<int>((x2_raw - pad_x) / scale);
+        int y2 = static_cast<int>((y2_raw - pad_y) / scale);
+
+        // Clamp to frame bounds
         x1 = std::max(0, std::min(x1, frame_w - 1));
         y1 = std::max(0, std::min(y1, frame_h - 1));
-        w = std::min(w, frame_w - x1);
-        h = std::min(h, frame_h - y1);
-        
-        boxes.emplace_back(x1, y1, w, h);
-        confidences.push_back(max_score);
-        class_ids.push_back(max_class);
+        x2 = std::max(0, std::min(x2, frame_w));
+        y2 = std::max(0, std::min(y2, frame_h));
+
+        int w = x2 - x1;
+        int h = y2 - y1;
+
+        if (w <= 0 || h <= 0) continue;
+
+        std::string label = (class_id < static_cast<int>(class_names.size()))
+            ? class_names[class_id] : std::to_string(class_id);
+
+        detections.emplace_back(x1, y1, w, h, class_id, conf, label);
     }
-    
-    std::vector<int> keep = nms(boxes, confidences, nms_threshold);
-    
-    std::vector<Detection> detections;
-    detections.reserve(keep.size());
-    
-    for (int idx : keep) {
-        std::string label = (class_ids[idx] < static_cast<int>(class_names.size())) 
-            ? class_names[class_ids[idx]] : std::to_string(class_ids[idx]);
-        detections.emplace_back(
-            boxes[idx].x, boxes[idx].y, boxes[idx].width, boxes[idx].height,
-            class_ids[idx], confidences[idx], label
-        );
-    }
-    
+
     return detections;
 }
 

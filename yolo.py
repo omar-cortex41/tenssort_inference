@@ -1,149 +1,153 @@
-# ============================================================
-# YOLO Object Detection with Ultralytics
-# ============================================================
-# This script reads a video, detects objects in each frame
-# using YOLO (You Only Look Once) neural network, and draws
-# bounding boxes around detected objects.
-# ============================================================
+#!/usr/bin/env python3
+"""Ultralytics YOLO Inference - Process video and save output"""
 
-import cv2                      # OpenCV - for reading video and drawing on frames
-from ultralytics import YOLO    # Ultralytics - the library that provides YOLO models
-import time                     # For measuring FPS
-import os                       # For extracting model name from path
+import cv2
+import time
+import os
+import yaml
+from ultralytics import YOLO
 
-# ------------------------------------------------------------
-# SETUP: Load video and model
-# ------------------------------------------------------------
 
-VIDEO_PATH = "videos/sg1.mkv"
-MODEL_PATH = "models/sgm.pt"
+def main():
+    # Load configuration
+    with open('config/config.yaml', 'r') as f:
+        cfg = yaml.safe_load(f)
 
-vid = cv2.VideoCapture(VIDEO_PATH)    # Open video file (use 0 for webcam)
-model = YOLO(MODEL_PATH)              # Load YOLO model weights (yolo11n = small/fast version)
-model.to("cuda")                      # Move model to GPU for faster inference
+    print("=" * 60)
+    print("Ultralytics YOLO Detector")
+    print("=" * 60)
 
-print(model.names)
+    # Get model path - use .pt version (derive from engine path)
+    engine_path = cfg['model']['engine_path']
+    model_path = engine_path.replace('.engine', '.pt').replace('_fp16', '').replace('_fp32', '')
 
-# Confidence threshold - only show detections with confidence >= this value
-conf = 0.7
+    # Check if .pt file exists, otherwise ask user
+    if not os.path.exists(model_path):
+        # Try common variations
+        base = os.path.splitext(engine_path)[0]
+        for suffix in ['', '_fp16', '_fp32']:
+            test_path = base.replace(suffix, '') + '.pt'
+            if os.path.exists(test_path):
+                model_path = test_path
+                break
+        else:
+            print(f"Model not found: {model_path}")
+            print("Please specify the .pt model path in config or place it in models/")
+            return
 
-# Check if video opened successfully
-if not vid.isOpened():
-    print("Cannot open stream")
-    exit()
+    conf_threshold = cfg['model']['conf_threshold']
+    video_path = cfg['video']['path']
+    class_names = cfg['class_names']
 
-# Get video properties for saving output
-frame_w = int(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
-frame_h = int(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
-vid_fps = vid.get(cv2.CAP_PROP_FPS)
+    print(f"\nModel: {model_path}")
+    print(f"Confidence threshold: {conf_threshold}")
+    print(f"Classes: {class_names}")
 
-# Create output video writer with model name
-model_name = os.path.splitext(os.path.basename(MODEL_PATH))[0]  # e.g., "yolo11m"
-output_path = f"{model_name}_output.mp4"
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out_vid = cv2.VideoWriter(output_path, fourcc, vid_fps, (frame_w, frame_h))
+    # Load model
+    print("\nLoading model...")
+    model = YOLO(model_path)
+    model.to("cuda")
+    print("Model loaded successfully!")
 
-# FPS tracking
-frame_times = []
-start_total = time.time()
+    # Open video
+    print(f"\nOpening video: {video_path}")
+    cap = cv2.VideoCapture(video_path)
 
-# ------------------------------------------------------------
-# MAIN LOOP: Process each frame
-# ------------------------------------------------------------
+    if not cap.isOpened():
+        print(f"Failed to open video: {video_path}")
+        return
 
-while True:
-    frame_start = time.time()    # Record time at start of frame
+    # Get video properties
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Read one frame from the video
-    # ret = True if frame was read successfully, False if video ended
-    # frame = the actual image (numpy array of pixels)
-    ret, frame = vid.read()
+    print(f"Video: {width}x{height} @ {fps:.1f} FPS, {total_frames} frames")
 
-    # If no frame was read, video has ended
-    if not ret:
-        break
+    # Setup output video
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    output_path = os.path.join(os.path.dirname(video_path) or '.', f"{video_name}_yolo_inference.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    # ------------------------------------------------------------
-    # DETECTION: Run YOLO on the frame
-    # ------------------------------------------------------------
+    print(f"Output: {output_path}")
+    print("\n" + "=" * 60)
+    print("Starting inference...")
+    print("=" * 60 + "\n")
 
-    # Pass the frame to YOLO - it returns a list of detection results
-    # The model automatically: resizes image, runs neural network, filters results
-    results = model(frame, conf=conf)
+    frame_count = 0
+    total_time = 0
 
-    # ------------------------------------------------------------
-    # DRAW: Loop through detections and draw boxes
-    # ------------------------------------------------------------
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-    # results is a list (one item per image, we only have 1 image)
-    for result in results:
-        # result.boxes contains all detected objects in this frame
-        boxes = result.boxes
+            # Run detection
+            start = time.time()
+            results = model(frame, conf=conf_threshold, verbose=False)
+            elapsed = time.time() - start
+            total_time += elapsed
+            frame_count += 1
 
-        # Loop through each detected object
-        for box in boxes:
-            # box.xyxy[0] = coordinates as [x1, y1, x2, y2]
-            #   x1, y1 = top-left corner
-            #   x2, y2 = bottom-right corner
-            x1, y1, x2, y2 = map(int, box.xyxy[0])  # Convert to integers for drawing
+            # Calculate FPS
+            current_fps = 1.0 / elapsed if elapsed > 0 else 0
+            avg_fps = frame_count / total_time if total_time > 0 else 0
 
-            # box.cls[0] = class ID (a number like 0=person, 2=car, etc.)
-            cls_id = int(box.cls[0])
+            # Process detections
+            detections = []
+            for result in results:
+                boxes = result.boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    label = model.names[cls_id]
+                    detections.append((x1, y1, x2, y2, label, conf))
 
-            # model.names is a dictionary: {0: "person", 1: "bicycle", 2: "car", ...}
-            # Look up the human-readable name for this class ID
-            label = model.names[cls_id]
+                    # Draw box
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    text = f"{label} {conf:.2f}"
+                    (lw, lh), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    cv2.rectangle(frame, (x1, y1 - lh - 6), (x1 + lw, y1), (0, 255, 0), -1)
+                    cv2.putText(frame, text, (x1, y1 - 4),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-            # Draw a green rectangle around the detected object
-            # (0, 255, 0) = green color in BGR format
-            # 2 = line thickness in pixels
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            # Log detections
+            det_summary = ", ".join([f"{d[4]}:{d[5]:.2f}" for d in detections[:5]])
+            if len(detections) > 5:
+                det_summary += f", ... (+{len(detections)-5} more)"
 
-            # Draw the label text above the box
-            cv2.putText(
-                frame,                      # Image to draw on
-                label,                      # Text to display
-                (x1, y1 - 10),              # Position (slightly above the box)
-                cv2.FONT_HERSHEY_SIMPLEX,   # Font style
-                0.5,                        # Font scale (size)
-                (0, 255, 0),                # Text color (green)
-                2                           # Text thickness
-            )
+            print(f"Frame {frame_count:5d}/{total_frames} | "
+                  f"FPS: {current_fps:5.1f} (avg: {avg_fps:5.1f}) | "
+                  f"Detections: {len(detections):3d} | {det_summary}")
 
-    # ------------------------------------------------------------
-    # DISPLAY: Show the frame with detections
-    # ------------------------------------------------------------
+            # Draw FPS on frame
+            cv2.putText(frame, f"FPS: {current_fps:.1f}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-    # Calculate and display FPS
-    frame_time = time.time() - frame_start
-    frame_times.append(frame_time)
-    fps = 1 / frame_time if frame_time > 0 else 0
-    cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            # Write frame
+            writer.write(frame)
 
-    out_vid.write(frame)       # Write frame to output video
-    cv2.imshow("YOLO Detection", frame)
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user")
 
-    # Wait 1ms for a key press. If 'q' is pressed, exit the loop
-    # waitKey(1) returns the ASCII code of the pressed key, or -1 if no key
-    if cv2.waitKey(1) == ord('q'):
-        break
+    # Cleanup
+    cap.release()
+    writer.release()
 
-# ------------------------------------------------------------
-# CLEANUP & STATS
-# ------------------------------------------------------------
+    # Final stats
+    print("\n" + "=" * 60)
+    print("COMPLETE")
+    print("=" * 60)
+    print(f"Processed frames: {frame_count}")
+    print(f"Total time: {total_time:.2f}s")
+    print(f"Average FPS: {frame_count / total_time:.2f}" if total_time > 0 else "N/A")
+    print(f"Output saved: {output_path}")
+    print("=" * 60)
 
-total_time = time.time() - start_total
-total_frames = len(frame_times)
-avg_fps = total_frames / total_time if total_time > 0 else 0
 
-print(f"\n{'='*50}")
-print(f"Model: {MODEL_PATH}")
-print(f"Total frames: {total_frames}")
-print(f"Total time: {total_time:.2f}s")
-print(f"Average FPS: {avg_fps:.2f}")
-print(f"Output saved to: {output_path}")
-print(f"{'='*50}\n")
-
-vid.release()              # Close the video file
-out_vid.release()          # Close output video
-cv2.destroyAllWindows()    # Close all OpenCV windows
+if __name__ == "__main__":
+    main()

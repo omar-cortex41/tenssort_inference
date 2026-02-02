@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Stream Video Handler (SHARED DETECTOR + WEB STREAMING)
+Multi-Stream Video Handler (SHARED DETECTOR + LOGGING)
 
 Architecture:
 - ONE shared detector (cached in GPU memory)
@@ -8,10 +8,7 @@ Architecture:
 - Mutex ensures thread-safe detector access
 
 Usage:
-    python multi_stream.py              # Web streaming mode (default)
-    python multi_stream.py --cv2        # OpenCV window mode
-
-Web interface: http://localhost:5000
+    python multi_stream.py
 
 Configure streams in config/config.yaml under 'streams' section.
 """
@@ -28,9 +25,7 @@ sys.path.insert(0, 'trt_detector/build')
 
 import cv2
 import numpy as np
-from flask import Flask, Response, render_template_string
 from trt_detector import DetectorService, ModelConfig
-import bytetrack_cpp as bt
 
 
 # ============================================================================
@@ -172,7 +167,6 @@ class FrameResult:
     stream_id: int                    # Which camera/stream
     frame: np.ndarray                 # The frame image
     detections: List                  # Raw detections
-    tracks: List                      # Tracked objects with IDs
     fps: float                        # Actual FPS
     timestamp: float                  # When frame was captured
 
@@ -180,7 +174,7 @@ class FrameResult:
 class VideoStream(threading.Thread):
     """
     Handles a single video/camera stream in its own thread.
-    Uses SHARED detector (singleton) + own tracker for independent tracking.
+    Uses SHARED detector (singleton).
     """
 
     def __init__(self, stream_id: int, source: str, name: str, output_queue: Queue):
@@ -190,8 +184,6 @@ class VideoStream(threading.Thread):
         self.name = name
         self.output_queue = output_queue  # Queue to send results to main thread
 
-        # Uses shared detector (singleton) - no detector member needed
-        self.tracker = None               # Each stream has its own tracker
         self.cap = None
         self.video_fps = 30
         self.width = 0
@@ -204,21 +196,6 @@ class VideoStream(threading.Thread):
         self.fps_frame_count = 0
         self.actual_fps = 0.0
 
-        # Get tracking config
-        self.track_cfg = cfg.get('tracking', {})
-        self.track_class_ids = self._get_track_class_ids()
-
-    def _get_track_class_ids(self) -> set:
-        """Convert class names to IDs for filtering"""
-        track_classes_cfg = self.track_cfg.get('track_classes', [])
-        track_class_ids = set()
-        for cls in track_classes_cfg:
-            if isinstance(cls, int):
-                track_class_ids.add(cls)
-            elif isinstance(cls, str) and cls in cfg['class_names']:
-                track_class_ids.add(cfg['class_names'].index(cls))
-        return track_class_ids
-
     def _setup_video(self) -> bool:
         """Open video source"""
         self.cap = cv2.VideoCapture(self.source)
@@ -229,15 +206,6 @@ class VideoStream(threading.Thread):
         self.video_fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        # Create tracker
-        tracker_config = bt.TrackerConfig(
-            self.track_cfg['track_thresh'],
-            self.track_cfg['match_thresh'],
-            self.track_cfg['track_buffer'],
-            int(self.video_fps)
-        )
-        self.tracker = bt.BYTETracker(tracker_config)
 
         print(f"[Stream {self.stream_id}] Ready: {self.name} ({self.width}x{self.height} @ {self.video_fps:.1f} fps)")
         return True
@@ -267,21 +235,8 @@ class VideoStream(threading.Thread):
                 if not ret:
                     break
 
-            # Detect (thread-safe via mutex in SharedDetector)
+            # Detect (thread-safe via queue in SharedDetector)
             detections = shared_detector.detect(frame)
-
-            # Filter by class
-            if self.track_class_ids:
-                dets_to_track = [d for d in detections if d.class_id in self.track_class_ids]
-            else:
-                dets_to_track = detections
-
-            # Track
-            cpp_dets = [
-                bt.Detection(d.x, d.y, d.width, d.height, d.confidence, d.class_id, d.label)
-                for d in dets_to_track
-            ]
-            tracks = self.tracker.update(cpp_dets)
 
             # Update FPS
             self.frame_count += 1
@@ -298,7 +253,6 @@ class VideoStream(threading.Thread):
                 stream_id=self.stream_id,
                 frame=frame,
                 detections=detections,
-                tracks=tracks,
                 fps=self.actual_fps,
                 timestamp=now
             )
@@ -372,194 +326,83 @@ class MultiStreamManager:
 
 
 def draw_results(frame: np.ndarray, result: FrameResult, stream_name: str) -> np.ndarray:
-    """Draw detections and tracks on frame"""
-    # Get set of tracked bounding boxes to avoid drawing them twice
-    tracked_boxes = set()
-    for track in result.tracks:
-        x, y, w, h = [int(v) for v in track.tlwh]
-        tracked_boxes.add((x, y, w, h))
-
-    # Draw ALL detections (gray boxes, with class label)
+    """Draw detections on frame"""
+    # Draw all detections
     for det in result.detections:
         x, y, w, h = det.x, det.y, det.width, det.height
-        # Skip if this detection is being tracked (will draw with ID below)
-        if (x, y, w, h) in tracked_boxes:
-            continue
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (128, 128, 128), 2)
-        # Draw class label
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
         label = f"{det.label} {det.confidence:.2f}"
         (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(frame, (x, y - lh - 6), (x + lw, y), (128, 128, 128), -1)
-        cv2.putText(frame, label, (x, y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-    # Draw tracked objects (colored boxes with ID)
-    for track in result.tracks:
-        x, y, w, h = [int(v) for v in track.tlwh]
-        color = get_color(track.track_id)
-        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-
-        class_name = cfg['class_names'][track.class_id] if track.class_id < len(cfg['class_names']) else str(track.class_id)
-        label = f"ID:{track.track_id} {class_name} {track.score:.2f}"
-        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(frame, (x, y - lh - 6), (x + lw, y), color, -1)
+        cv2.rectangle(frame, (x, y - lh - 6), (x + lw, y), (0, 255, 0), -1)
         cv2.putText(frame, label, (x, y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     # Draw stream info
     cv2.putText(frame, f"{stream_name}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     cv2.putText(frame, f"FPS: {result.fps:.1f}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    cv2.putText(frame, f"Tracks: {len(result.tracks)}", (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.putText(frame, f"Detections: {len(result.detections)}", (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
     return frame
-
-
-# ============================================================================
-# WEB STREAMING (Flask + MJPEG)
-# ============================================================================
-
-# Flask app for web streaming
-app = Flask(__name__)
-manager = None  # Global reference for Flask routes
-
-# HTML template for the web interface
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Multi-Stream Monitor</title>
-    <style>
-        body {
-            background: #1a1a2e;
-            color: #eee;
-            font-family: Arial, sans-serif;
-            margin: 0;
-            padding: 20px;
-        }
-        h1 { color: #0f9; text-align: center; }
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(640px, 1fr));
-            gap: 20px;
-            max-width: 1920px;
-            margin: 0 auto;
-        }
-        .stream {
-            background: #16213e;
-            border-radius: 10px;
-            overflow: hidden;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-        }
-        .stream h3 {
-            margin: 0;
-            padding: 10px 15px;
-            background: #0f3460;
-        }
-        .stream img {
-            width: 100%;
-            display: block;
-        }
-    </style>
-</head>
-<body>
-    <h1>🎥 Multi-Stream Monitor</h1>
-    <div class="grid">
-        {% for stream_id, name in streams %}
-        <div class="stream">
-            <h3>{{ name }}</h3>
-            <img src="/stream/{{ stream_id }}" alt="{{ name }}">
-        </div>
-        {% endfor %}
-    </div>
-</body>
-</html>
-"""
-
-@app.route('/')
-def index():
-    """Render the main page with all stream views"""
-    streams = [(sid, s.name) for sid, s in manager.streams.items()]
-    return render_template_string(HTML_TEMPLATE, streams=streams)
-
-
-def generate_frames(stream_id: int):
-    """Generator that yields MJPEG frames for a specific stream"""
-    while True:
-        results = manager.get_latest_results()
-        if stream_id in results:
-            result = results[stream_id]
-            stream = manager.streams[stream_id]
-            frame = draw_results(result.frame.copy(), result, stream.name)
-
-            # Encode to JPEG
-            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            frame_bytes = buffer.tobytes()
-
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        else:
-            time.sleep(0.01)
-
-
-@app.route('/stream/<int:stream_id>')
-def stream(stream_id: int):
-    """MJPEG stream endpoint for a specific camera"""
-    return Response(
-        generate_frames(stream_id),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
 
 
 # ============================================================================
 # MAIN
 # ============================================================================
 
-def run_cv2_mode(mgr):
-    """Original OpenCV window mode"""
-    print("Processing streams... Press 'q' to quit\n")
+def run_logging_mode(mgr):
+    """Logging mode - output detections and FPS to console"""
+    print("\n" + "=" * 80)
+    print("Starting inference... Press Ctrl+C to stop")
+    print("=" * 80 + "\n")
 
-    while True:
-        results = mgr.get_latest_results()
+    # Track stats per stream
+    stream_stats = {sid: {'frames': 0, 'total_time': 0} for sid in mgr.streams}
+    last_log_time = {sid: time.time() for sid in mgr.streams}
 
-        if not results:
-            time.sleep(0.01)
-            continue
+    try:
+        while True:
+            results = mgr.get_latest_results()
 
-        for stream_id, result in results.items():
-            stream = mgr.streams[stream_id]
-            frame = draw_results(result.frame.copy(), result, stream.name)
-            cv2.imshow(stream.name, frame)
+            if not results:
+                time.sleep(0.01)
+                continue
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            for stream_id, result in results.items():
+                stream = mgr.streams[stream_id]
+                stats = stream_stats[stream_id]
+                stats['frames'] += 1
+
+                # Log every frame
+                det_summary = ", ".join([
+                    f"{cfg['class_names'][d.class_id] if d.class_id < len(cfg['class_names']) else d.class_id}:{d.confidence:.2f}"
+                    for d in result.detections[:5]
+                ])
+                if len(result.detections) > 5:
+                    det_summary += f", ... (+{len(result.detections)-5} more)"
+
+                print(f"[{stream.name}] Frame {stats['frames']:5d} | "
+                      f"FPS: {result.fps:5.1f} | "
+                      f"Detections: {len(result.detections):3d} | {det_summary}")
+
+    except KeyboardInterrupt:
+        print("\n\nStopping...")
+
+    # Final stats
+    print("\n" + "=" * 80)
+    print("COMPLETE")
+    print("=" * 80)
+    for stream_id, stream in mgr.streams.items():
+        stats = stream_stats[stream_id]
+        print(f"[{stream.name}] Processed {stats['frames']} frames")
+    print("=" * 80)
 
     mgr.stop_all()
     SharedDetector().stop()
-    cv2.destroyAllWindows()
-
-
-def run_web_mode(mgr, host='0.0.0.0', port=5000):
-    """Web streaming mode"""
-    global manager
-    manager = mgr
-
-    print(f"\n{'='*50}")
-    print(f"  Web interface: http://localhost:{port}")
-    print(f"  Press Ctrl+C to stop")
-    print(f"{'='*50}\n")
-
-    try:
-        app.run(host=host, port=port, threaded=True, debug=False)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        mgr.stop_all()
-        SharedDetector().stop()
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Multi-Stream Video Handler')
-    parser.add_argument('--cv2', action='store_true', help='Use OpenCV windows instead of web streaming')
-    parser.add_argument('--port', type=int, default=5000, help='Web server port (default: 5000)')
-    args = parser.parse_args()
+    print("=" * 60)
+    print("Multi-Stream TensorRT Detector")
+    print("=" * 60)
 
     # Get streams from config
     streams_cfg = cfg.get('streams', [])
@@ -604,10 +447,7 @@ def main():
 
     print(f"Processing {len(mgr.streams)} stream(s) with SHARED DETECTOR...")
 
-    if args.cv2:
-        run_cv2_mode(mgr)
-    else:
-        run_web_mode(mgr, port=args.port)
+    run_logging_mode(mgr)
 
     print("\nDone!")
 

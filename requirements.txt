@@ -4,9 +4,13 @@ opencv-python
 ultralytics
 pybind11
 pyyaml
+tensorrt
+cutensor
+fastapi
+uvicorn[standard]
 
 # Note: The following must be installed separately (not via pip):
 # - CUDA Toolkit (11.x or 12.x)
-# - TensorRT (8.x or 10.x)
+# - TensorRT C++ headers (for building the TRT detector)
 # - OpenCV C++ libraries (for building the TRT detector)
 

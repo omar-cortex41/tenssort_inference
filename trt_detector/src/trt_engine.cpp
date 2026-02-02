@@ -165,8 +165,8 @@ void TRTEngine::allocateBuffers() {
         }
     }
 
-    // Allocate source buffer for max batch of 1080p images
-    src_size_ = 1920 * 1080 * 3 * max_batch_size_;
+    // Allocate source buffer for max batch of 4K images (3840x2160)
+    src_size_ = 3840 * 2160 * 3 * max_batch_size_;
     cudaMalloc(&d_src_, src_size_);
 
     std::cout << "[TRTEngine] Max batch size: " << max_batch_size_ << std::endl;
