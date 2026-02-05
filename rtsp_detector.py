@@ -267,6 +267,12 @@ def main():
     fps_start_time = time.time()
     current_fps = 0.0
 
+    # Display frame skip (from config)
+    display_config = config.get('display', {})
+    frame_skip = display_config.get('frame_skip', 1)
+    display_frame_counter = 0
+    print(f"    Display frame skip: {frame_skip} (show every {frame_skip} frame(s))")
+
     # Camera IDs to fetch (all streams, up to max batch size)
     camera_ids = list(range(min(num_streams, max_batch)))
 
@@ -401,12 +407,15 @@ def main():
                 print(f"\rFPS: {current_fps:.1f} total | {per_stream_fps:.1f}/stream | "
                       f"Inf: {avg_inference:.1f}ms | Cap: {avg_capture:.1f}ms | Mode: {mode}   ", end='', flush=True)
 
-            # === DISPLAY ===
-            # Send frame data to display thread (handles resize + drawing)
-            stats = (f"FPS: {current_fps:.1f} total | {per_stream_fps:.1f}/stream | "
-                    f"Inf: {avg_inference:.1f}ms | Cap: {avg_capture:.1f}ms | "
-                    f"Mode: {'GPU' if use_zero_copy else 'NV12'}")
-            display_thread.show(last_frame_data, stats)
+            # === DISPLAY (with frame skip) ===
+            display_frame_counter += 1
+            if display_frame_counter >= frame_skip:
+                display_frame_counter = 0
+                # Send frame data to display thread (handles resize + drawing)
+                stats = (f"FPS: {current_fps:.1f} total | {per_stream_fps:.1f}/stream | "
+                        f"Inf: {avg_inference:.1f}ms | Cap: {avg_capture:.1f}ms | "
+                        f"Mode: {'GPU' if use_zero_copy else 'NV12'}")
+                display_thread.show(last_frame_data, stats)
 
     except KeyboardInterrupt:
         print("\nStopping...")

@@ -4,6 +4,10 @@ model:
   nms_threshold: 0.45
   input_width: 640
   input_height: 640
+
+# Display settings
+display:
+  frame_skip: 3  # Show every Nth frame (1 = show all, 3 = show every 3rd frame)
 video:
   path: videos/vid5.mp4
 class_names:
@@ -106,15 +110,15 @@ streams:
 - id: 3
   source: videos/vid4.mp4
   name: Stream 4
-# - id: 4
-#   source: videos/vid5.mp4
-#   name: Stream 5
-# - id: 5
-#   source: videos/vid6.mp4
-#   name: Stream 6
-# - id: 6
-#   source: videos/vid7.mp4
-#   name: Stream 7
-# - id: 7
-#   source: videos/vid8.mp4
-#   name: Stream 8
+- id: 4
+  source: videos/vid5.mp4
+  name: Stream 5
+- id: 5
+  source: videos/vid6.mp4
+  name: Stream 6
+- id: 6
+  source: videos/vid7.mp4
+  name: Stream 7
+- id: 7
+  source: videos/vid8.mp4
+  name: Stream 8

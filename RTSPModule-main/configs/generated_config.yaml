@@ -17,3 +17,11 @@ streams:
   url: /home/omar/work/tenssort_inference/videos/vid3.mp4
 - name: Stream 4
   url: /home/omar/work/tenssort_inference/videos/vid4.mp4
+- name: Stream 5
+  url: /home/omar/work/tenssort_inference/videos/vid5.mp4
+- name: Stream 6
+  url: /home/omar/work/tenssort_inference/videos/vid6.mp4
+- name: Stream 7
+  url: /home/omar/work/tenssort_inference/videos/vid7.mp4
+- name: Stream 8
+  url: /home/omar/work/tenssort_inference/videos/vid8.mp4
