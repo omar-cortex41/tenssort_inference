@@ -1,0 +1,19 @@
+settings:
+  backoff_multiplier: 2
+  buffer_size: 3
+  cpu_buffer_duration_sec: 2.0
+  cpu_buffer_enabled: true
+  decoder_preference: auto
+  gpu_id: 0
+  log_base_path: ./logs
+  output_format: NV12
+  retry_max_attempts: 0
+streams:
+- name: Stream 1
+  url: /home/omar/work/tenssort_inference/videos/vid1.mp4
+- name: Stream 2
+  url: /home/omar/work/tenssort_inference/videos/vid2.mp4
+- name: Stream 3
+  url: /home/omar/work/tenssort_inference/videos/vid3.mp4
+- name: Stream 4
+  url: /home/omar/work/tenssort_inference/videos/vid4.mp4

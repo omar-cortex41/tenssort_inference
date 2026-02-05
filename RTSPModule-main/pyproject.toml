@@ -1,0 +1,75 @@
+[build-system]
+requires = ["scikit-build-core>=0.8", "pybind11>=2.11"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "rtspmodule"
+version = "1.0.0"
+description = "Hardware-accelerated multi-stream RTSP decoder with GPU/CPU buffer support"
+readme = "docs/README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9,<3.13"
+authors = [
+    {name = "RTSPModule Team"}
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+keywords = ["rtsp", "streaming", "video", "cuda", "gstreamer", "nvdec", "hardware-acceleration"]
+dependencies = [
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "cupy-cuda12x",
+    "opencv-python",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/RTSPModule"
+Documentation = "https://github.com/your-org/RTSPModule#readme"
+
+[tool.scikit-build]
+wheel.packages = ["src/rtspmodule"]
+cmake.build-type = "Release"
+cmake.verbose = true
+
+# Build only the Python module, not tests
+cmake.targets = ["_core"]
+
+# Minimum CMake version
+cmake.minimum-version = "3.18"
+
+[tool.scikit-build.cmake.define]
+# Let CMake find Python automatically
+# Python3_EXECUTABLE can be overridden via environment
+
+[tool.cibuildwheel]
+# Only build for Linux x86_64
+build = "cp39-manylinux_x86_64 cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64"
+skip = "*-musllinux*"
+
+# Don't repair wheels (we require system GStreamer/CUDA)
+repair-wheel-command = ""
+
+[tool.cibuildwheel.linux]
+# Install build dependencies in the container
+before-all = [
+    "yum install -y gstreamer1-devel gstreamer1-plugins-base-devel yaml-cpp-devel || apt-get update && apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libyaml-cpp-dev",
+]
+
+# Environment for CUDA (adjust path as needed)
+environment = { CUDA_HOME = "/usr/local/cuda" }

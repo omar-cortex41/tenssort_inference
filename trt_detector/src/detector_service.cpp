@@ -38,6 +38,27 @@ std::vector<std::vector<Detection>> DetectorService::detectBatch(const std::vect
     return engine_->detectBatch(frames);
 }
 
+std::vector<std::vector<Detection>> DetectorService::detectBatchGpuNV12(
+    const std::vector<uint64_t>& gpu_ptrs,
+    const std::vector<int>& widths,
+    const std::vector<int>& heights
+) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!engine_) return {};
+    return engine_->detectBatchGpuNV12(gpu_ptrs, widths, heights);
+}
+
+std::vector<std::vector<Detection>> DetectorService::detectBatchNV12(
+    const std::vector<const uint8_t*>& nv12_data,
+    const std::vector<size_t>& data_sizes,
+    const std::vector<int>& widths,
+    const std::vector<int>& heights
+) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!engine_) return {};
+    return engine_->detectBatchNV12(nv12_data, data_sizes, widths, heights);
+}
+
 int DetectorService::getMaxBatchSize() const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!engine_) return 0;

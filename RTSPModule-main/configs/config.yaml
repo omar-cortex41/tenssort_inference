@@ -1,0 +1,42 @@
+settings:
+  buffer_size: 3           # Frame buffer queue depth (default: 5 frames)
+  retry_max_attempts: 0    # Max reconnection attempts per stream (0 = unlimited)
+  backoff_multiplier: 2    # Delay multiplier on failed reconnects (1.0 = no backoff)
+  gpu_id: 0                # GPU device ID for hardware decoding
+  log_base_path: ./logs    # Log base path
+  
+  # CPU Buffer settings (for 2-second frame history in RAM)
+  cpu_buffer_enabled: true        # Auto-enabled if GPU (nvdec/cudaconvert) unavailable
+  cpu_buffer_duration_sec: 2.0    # Seconds of video to buffer (default: 2.0)
+  
+  # Output format: NV12, RGB, BGR (default), RGBA, I420
+  output_format: NV12           # Optimal for simplejpeg encoding in web_viewer.py
+  
+  # Decoder preference: auto (default), nvv4l2, nvdec, cpu
+  # auto = Use nvv4l2decoder if DeepStream is available, then nvdec, then cpu
+  # nvv4l2 = Force DeepStream decoder (fails if unavailable)
+  # nvdec = Force standard GStreamer NVDEC (nvh264dec/nvh265dec)
+  # cpu = Force CPU decoding (avdec) for testing
+  decoder_preference: auto
+
+# Direct local video files (no RTSP overhead)
+# Supports: file:// URLs or direct paths
+streams:
+  - name: "Stream 1"
+    url: /home/omar/work/tenssort_inference/videos/vid1.mp4
+  - name: "Stream 2"
+    url: /home/omar/work/tenssort_inference/videos/vid2.mp4
+  - name: "Stream 3"
+    url: /home/omar/work/tenssort_inference/videos/vid3.mp4
+  - name: "Stream 4"
+    url: /home/omar/work/tenssort_inference/videos/vid4.mp4
+  - name: "Stream 5"
+    url: /home/omar/work/tenssort_inference/videos/vid5.mp4
+  - name: "Stream 6"
+    url: /home/omar/work/tenssort_inference/videos/vid6.mp4
+  - name: "Stream 7"
+    url: /home/omar/work/tenssort_inference/videos/vid7.mp4
+  - name: "Stream 8"
+    url: /home/omar/work/tenssort_inference/videos/vid8.mp4
+ 
+  

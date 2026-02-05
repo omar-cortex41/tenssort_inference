@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""TensorRT YOLO Detector - Process video and save output"""
+"""TensorRT YOLO Detector - Process video with real-time display"""
 
 import sys
 import time
 import yaml
-import os
 sys.path.insert(0, 'trt_detector/build')
 
 import cv2
@@ -56,17 +55,17 @@ def main():
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     print(f"Video: {width}x{height} @ {fps:.1f} FPS, {total_frames} frames")
-
-    # Setup output video
-    video_name = os.path.splitext(os.path.basename(video_path))[0]
-    output_path = os.path.join(os.path.dirname(video_path) or '.', f"{video_name}_inference.mp4")
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-    print(f"Output: {output_path}")
     print("\n" + "=" * 60)
-    print("Starting inference...")
+    print("Starting inference... Press 'q' to quit")
     print("=" * 60 + "\n")
+
+    # Create window for display
+    window_name = "TensorRT YOLO Detector"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    # Set window size to 1280x720 (or maintain aspect ratio of video)
+    display_width = 1280
+    display_height = int(display_width * height / width)
+    cv2.resizeWindow(window_name, display_width, display_height)
 
     frame_count = 0
     total_time = 0
@@ -101,25 +100,34 @@ def main():
             for det in detections:
                 x, y, w, h = det.x, det.y, det.width, det.height
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                label = f"{det.label} {det.confidence:.2f}"
-                (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                cv2.rectangle(frame, (x, y - lh - 6), (x + lw, y), (0, 255, 0), -1)
+                # Include class ID in label and make it bigger
+                label = f"[{det.class_id}] {det.label} {det.confidence:.2f}"
+                font_scale = 0.8
+                thickness = 2
+                (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                cv2.rectangle(frame, (x, y - lh - 8), (x + lw, y), (0, 255, 0), -1)
                 cv2.putText(frame, label, (x, y - 4),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
 
             # Draw FPS on frame
             cv2.putText(frame, f"FPS: {current_fps:.1f}", (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-            # Write frame
-            writer.write(frame)
+            # Display frame
+            cv2.imshow(window_name, frame)
+
+            # Check for quit key ('q' or ESC)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == 27:
+                print("\n\nStopped by user")
+                break
 
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
 
     # Cleanup
     cap.release()
-    writer.release()
+    cv2.destroyAllWindows()
 
     # Final stats
     print("\n" + "=" * 60)
@@ -128,7 +136,6 @@ def main():
     print(f"Processed frames: {frame_count}")
     print(f"Total time: {total_time:.2f}s")
     print(f"Average FPS: {frame_count / total_time:.2f}" if total_time > 0 else "N/A")
-    print(f"Output saved: {output_path}")
     print("=" * 60)
 
 

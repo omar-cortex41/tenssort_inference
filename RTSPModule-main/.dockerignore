@@ -1,0 +1,33 @@
+# Version Control
+.git
+.gitignore
+.dockerignore
+
+# IMPORTANT: Never copy the host build folder into the container
+build/
+cmake-build-debug/
+cmake-build-release/
+
+# Don't copy locally compiled binaries, let Docker build them fresh
+*.so
+*.a
+RTSPModule.cpython-*.so
+*.whl
+
+# Python
+__pycache__/
+*.pyc
+env/
+venv/
+dist/
+
+# IDE Settings 
+.vscode/
+.idea/
+
+# Documentation
+# README.md (Docker might need it?)
+
+# Runtime (Generated)
+output/
+logs/

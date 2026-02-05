@@ -1,0 +1,44 @@
+# Build Artifacts (C++/CMake)
+build/
+build_health/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.so
+*.a
+
+# Shared Module
+RTSPModule.cpython-*-linux-gnu.so
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# IDEs / Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Generated
+.DS_Store
+Thumbs.db
+
+# Runtime Directories
+logs/
+output/
+dist/
+dist_artifacts/
+lib/
+
+# Models (ignore at root, keep models/ directory structure)
+/*.pt
+/*.onnx
+/*.engine

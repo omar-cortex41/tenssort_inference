@@ -1,0 +1,76 @@
+
+# Dockerfile.runtime
+# This Dockerfile allows building the runtime image using pre-built artifacts
+# without needing the source code.
+#
+# Prerequisites:
+# 1. Build artifacts using Dockerfile.pytorch target=export
+#    DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.pytorch --target export --output type=local,dest=./dist_artifacts .
+# 2. Build this image from the dist_artifacts directory
+#    cd dist_artifacts && docker build -f ../docker/Dockerfile.runtime -t rtsp-module-runtime .
+
+ARG PYTORCH_RUNTIME_IMAGE=pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+
+FROM ${PYTORCH_RUNTIME_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+# Runtime dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    libglib2.0-0 \
+    libssl3 \
+    libx11-6 \
+    libxext6 \
+    libxrender1 \
+    libyaml-cpp-dev \
+    libgl1 \
+    libegl1 \
+    libva-drm2 \
+    libnice10 \
+    libsrtp2-1 \
+    libusrsctp2 \
+    libfontconfig1 \
+    libmp3lame0 \
+    vainfo \
+    wget \
+    && wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
+    && dpkg -i cuda-keyring_1.1-1_all.deb \
+    && apt-get update \
+    && apt-get install -y cuda-nvrtc-12-4 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/local/cuda-12.4 /usr/local/cuda \
+    && ln -s /usr/local/cuda-12.4/targets/x86_64-linux/lib/libnvrtc.so.12 /usr/lib/x86_64-linux-gnu/libnvrtc.so
+
+# Copy pre-built artifacts from the build context (dist_artifacts)
+# Note: The context is expected to contain 'gst' and 'wheels' folders
+COPY gst /opt/gst
+COPY wheels /wheels
+
+ENV PATH=/opt/gst/bin:/usr/local/cuda/bin:$PATH
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/gst/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/opt/conda/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:$LD_LIBRARY_PATH
+ENV PKG_CONFIG_PATH=/opt/gst/lib/x86_64-linux-gnu/pkgconfig
+
+WORKDIR /workspace
+
+# Install rtspmodule from wheel matching container's Python version
+# Wheel names are like: rtspmodule-1.0.0-cp311-cp311-linux_x86_64.whl
+RUN PY_VER=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')") && \
+    WHEEL=$(ls /wheels/rtspmodule-*-${PY_VER}-*.whl 2>/dev/null | head -1) && \
+    if [ -z "$WHEEL" ]; then echo "ERROR: No wheel found for Python $PY_VER"; exit 1; fi && \
+    pip3 install --no-cache-dir "$WHEEL" \
+    cupy-cuda12x \
+    opencv-python \
+    pyyaml \
+    pynvml \
+    psutil \
+    aiohttp \
+    simplejpeg \
+    && rm -rf /wheels
+
+# Refresh shared library cache
+RUN ldconfig
+
+CMD ["/bin/bash"]

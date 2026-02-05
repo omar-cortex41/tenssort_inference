@@ -33,6 +33,38 @@ public:
     // Batched detection - returns vector of detections per frame
     std::vector<std::vector<Detection>> detectBatch(const std::vector<cv::Mat>& frames);
 
+    /**
+     * Zero-copy batched detection from GPU NV12 frames
+     * For RTSPModule integration - frames stay on GPU the entire time
+     *
+     * @param gpu_ptrs Vector of CUDA device pointers to NV12 frames
+     * @param widths   Width of each frame
+     * @param heights  Height of each frame
+     * @return Vector of detections per frame
+     */
+    std::vector<std::vector<Detection>> detectBatchGpuNV12(
+        const std::vector<uint64_t>& gpu_ptrs,
+        const std::vector<int>& widths,
+        const std::vector<int>& heights
+    );
+
+    /**
+     * Batched detection from CPU NV12 frames
+     * Skips CPU color conversion - uploads NV12 directly to GPU and converts there
+     * Much faster than cv2.cvtColor + detectBatch
+     *
+     * @param nv12_frames Vector of NV12 frame data (H*1.5 x W bytes each)
+     * @param widths      Width of each frame
+     * @param heights     Height of each frame (Y plane height, not total)
+     * @return Vector of detections per frame
+     */
+    std::vector<std::vector<Detection>> detectBatchNV12(
+        const std::vector<const uint8_t*>& nv12_data,
+        const std::vector<size_t>& data_sizes,
+        const std::vector<int>& widths,
+        const std::vector<int>& heights
+    );
+
     bool isLoaded() const { return engine_ != nullptr; }
     const ModelConfig& getConfig() const { return config_; }
     int getMaxBatchSize() const { return max_batch_size_; }
@@ -52,13 +84,16 @@ private:
     float* h_output_ = nullptr;
     void* d_input_ = nullptr;
     void* d_output_ = nullptr;
-    uint8_t* d_src_ = nullptr;  // Device source image for CUDA preprocess
+    std::vector<uint8_t*> d_src_batch_;  // Per-batch source buffers for parallel preprocess
+    std::vector<uint8_t*> h_src_batch_;  // Pinned host staging buffers for faster H2D transfer
+    std::vector<cudaStream_t> preprocess_streams_;  // Streams for parallel preprocessing
+    std::vector<cudaEvent_t> preprocess_events_;    // Events for efficient multi-stream sync
 
     size_t input_size_per_batch_ = 0;   // Size for single image
     size_t output_size_per_batch_ = 0;  // Size for single image output
     size_t input_size_ = 0;             // Total allocated (max_batch * per_batch)
     size_t output_size_ = 0;            // Total allocated
-    size_t src_size_ = 0;
+    size_t src_size_per_batch_ = 0;     // Size for single source image
     int num_detections_ = 0;
     int max_batch_size_ = 1;
 

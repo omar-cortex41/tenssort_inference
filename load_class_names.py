@@ -1,8 +1,10 @@
+#!/usr/bin/env python3
+"""
+Load class names from a YOLO model and update config.yaml
+"""
 
-import sys
 import yaml
 from ultralytics import YOLO
-
 
 
 model_path = "models/yolo26m.pt"
@@ -31,4 +33,3 @@ with open(config_path, 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
 
 print("Done!")
-
