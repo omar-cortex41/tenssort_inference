@@ -77,9 +77,10 @@ class DisplayThread:
                     if frame is None:
                         continue
 
-                    # Resize in display thread (Fix #2 - moved from main loop)
+                    # OPTIMIZATION: Use INTER_LINEAR instead of INTER_NEAREST for better quality
+                    # INTER_LINEAR is faster than INTER_CUBIC and looks better than INTER_NEAREST
                     disp = cv2.resize(frame, (self.cell_w, self.cell_h),
-                                     interpolation=cv2.INTER_NEAREST)
+                                     interpolation=cv2.INTER_LINEAR)
 
                     # Draw detections with scaling
                     scale_x = self.cell_w / frame.shape[1]
@@ -148,13 +149,13 @@ def generate_rtsp_config(streams, output_path):
     """Generate RTSPModule config from main config streams."""
     rtsp_config = {
         'settings': {
-            'buffer_size': 3,
-            'retry_max_attempts': 0,
+            'buffer_size': 8,  # OPTIMIZATION: Increased from 3 to 8 for better buffering
+            'retry_max_attempts': -1,  # -1 = infinite retries (loop videos)
             'backoff_multiplier': 2,
             'gpu_id': 0,
             'log_base_path': './logs',
             'cpu_buffer_enabled': True,
-            'cpu_buffer_duration_sec': 2.0,
+            'cpu_buffer_duration_sec': 3.0,  # OPTIMIZATION: Increased from 2.0 to 3.0
             'output_format': 'NV12',
             'decoder_preference': 'auto'
         },
@@ -327,13 +328,17 @@ def main():
 
             else:
                 # CPU BUFFER PATH: Get batch of frames
-                batch_result = rtsp.get_batch(camera_ids, timeout_ms=10)
+                # OPTIMIZATION: Reduced timeout from 10ms to 5ms for faster frame acquisition
+                batch_result = rtsp.get_batch(camera_ids, timeout_ms=5)
                 capture_times.append((time.time() - t_cap) * 1000)
 
                 batch_data = batch_result['data']
                 valid_mask = batch_result['valid_mask']
 
                 if batch_result['valid_count'] == 0:
+                    # DEBUG: Print every 100 attempts to see if we're stuck
+                    if frame_counter % 100 == 0:
+                        print(f"[DEBUG] Waiting for frames... (no valid frames received yet)")
                     time.sleep(0.001)
                     continue
 
@@ -402,10 +407,13 @@ def main():
                 fps_start_time = time.time()
                 per_stream_fps = current_fps / len(camera_ids) if camera_ids else 0
 
-                # Print to console
+                # OPTIMIZATION: Enhanced performance stats
                 mode = 'GPU Zero-Copy' if use_zero_copy else 'NV12 Direct'
-                print(f"\rFPS: {current_fps:.1f} total | {per_stream_fps:.1f}/stream | "
-                      f"Inf: {avg_inference:.1f}ms | Cap: {avg_capture:.1f}ms | Mode: {mode}   ", end='', flush=True)
+                total_latency = avg_capture + avg_inference
+                gpu_util_estimate = (avg_inference / 16.6) * 100  # % of 60Hz frame time
+                print(f"\r[PERF] FPS: {current_fps:.1f} total | {per_stream_fps:.1f}/stream | "
+                      f"Inf: {avg_inference:.1f}ms | Cap: {avg_capture:.1f}ms | "
+                      f"Latency: {total_latency:.1f}ms | GPU~{gpu_util_estimate:.0f}% | Mode: {mode}   ", end='', flush=True)
 
             # === DISPLAY (with frame skip) ===
             display_frame_counter += 1
