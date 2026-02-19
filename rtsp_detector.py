@@ -7,6 +7,7 @@ import queue
 import cv2
 import numpy as np
 import yaml
+import hashlib
 from collections import deque
 
 # Add TRT detector path
@@ -260,6 +261,14 @@ def main():
     print("\nPress 'q' to quit")
     print("=" * 60)
 
+    # OPTIMIZATION: 3-stage async pipeline with queues
+    # Stage 1: Capture thread → capture_queue
+    # Stage 2: Inference thread (main) → inference_queue
+    # Stage 3: Display thread (existing) reads from last_frame_data
+
+    capture_queue = queue.Queue(maxsize=2)  # Small queue to prevent memory buildup
+    inference_queue = queue.Queue(maxsize=2)
+
     # Timing stats
     inference_times = deque(maxlen=60)
     capture_times = deque(maxlen=60)
@@ -284,31 +293,91 @@ def main():
     # Format: (frame, detections) tuples - display thread handles resize/draw
     last_frame_data = [None] * num_streams
 
+    # Capture thread - runs independently
+    capture_running = threading.Event()
+    capture_running.set()
+
+    def capture_worker():
+        """Dedicated capture thread - always grabbing frames"""
+        while capture_running.is_set():
+            try:
+                t_cap = time.time()
+
+                if use_zero_copy:
+                    # GPU zero-copy path
+                    gpu_ptrs = []
+                    widths = []
+                    heights = []
+                    valid_indices = []
+
+                    for cam_id in camera_ids:
+                        gpu_ptr, width, height, is_valid = rtsp.get_gpu_frame_ptr(cam_id)
+                        if is_valid:
+                            gpu_ptrs.append(gpu_ptr)
+                            widths.append(width)
+                            heights.append(height)
+                            valid_indices.append(cam_id)
+
+                    if gpu_ptrs:
+                        cap_time = (time.time() - t_cap) * 1000
+                        capture_queue.put(('gpu', gpu_ptrs, widths, heights, valid_indices, cap_time), timeout=0.1)
+                else:
+                    # CPU buffer path with dynamic batching
+                    MIN_BATCH_SIZE = 4
+                    MAX_BATCH_SIZE = 12
+
+                    batch_result = rtsp.get_batch(camera_ids, timeout_ms=2)
+                    valid_count = batch_result['valid_count']
+
+                    if valid_count == 0:
+                        time.sleep(0.001)
+                        continue
+
+                    # Try to batch up more frames if we have too few
+                    if valid_count < MIN_BATCH_SIZE:
+                        extra_result = rtsp.get_batch(camera_ids, timeout_ms=1)
+                        if extra_result['valid_count'] > 0:
+                            for i in range(len(camera_ids)):
+                                if extra_result['valid_mask'][i] and not batch_result['valid_mask'][i]:
+                                    batch_result['data'][i] = extra_result['data'][i]
+                                    batch_result['valid_mask'][i] = True
+                                    valid_count += 1
+                                    if valid_count >= MAX_BATCH_SIZE:
+                                        break
+
+                    if valid_count < MIN_BATCH_SIZE:
+                        time.sleep(0.001)
+                        continue
+
+                    cap_time = (time.time() - t_cap) * 1000
+                    capture_queue.put(('cpu', batch_result, cap_time), timeout=0.1)
+
+            except queue.Full:
+                # Queue is full, skip this frame (inference is bottleneck)
+                continue
+            except Exception as e:
+                if capture_running.is_set():
+                    print(f"[CAPTURE] Error: {e}")
+                time.sleep(0.01)
+
+    capture_thread = threading.Thread(target=capture_worker, daemon=True)
+    capture_thread.start()
+    print(f"    Started async capture pipeline")
+
     try:
         while display_thread.running:
-            # === CAPTURE ===
-            t_cap = time.time()
+            # === INFERENCE STAGE - Consume from capture queue ===
+            try:
+                capture_data = capture_queue.get(timeout=0.01)
+            except queue.Empty:
+                continue
 
-            if use_zero_copy:
-                # ZERO-COPY PATH: Get GPU pointers directly
-                gpu_ptrs = []
-                widths = []
-                heights = []
-                valid_indices = []
+            capture_mode = capture_data[0]
 
-                for cam_id in camera_ids:
-                    frame_info = rtsp.get_cuda_frame(camera_id=cam_id, timeout_ms=10)
-                    if frame_info['valid']:
-                        gpu_ptrs.append(frame_info['ptr'])
-                        widths.append(frame_info['width'])
-                        heights.append(frame_info['height'])
-                        valid_indices.append(cam_id)
-
-                capture_times.append((time.time() - t_cap) * 1000)
-
-                if not gpu_ptrs:
-                    time.sleep(0.001)
-                    continue
+            if capture_mode == 'gpu':
+                # GPU zero-copy path
+                _, gpu_ptrs, widths, heights, valid_indices, cap_time = capture_data
+                capture_times.append(cap_time)
 
                 # ZERO-COPY INFERENCE
                 t0 = time.time()
@@ -326,22 +395,13 @@ def main():
 
                 frame_counter += len(gpu_ptrs)
 
-            else:
-                # CPU BUFFER PATH: Get batch of frames
-                # OPTIMIZATION: Reduced timeout from 10ms to 5ms for faster frame acquisition
-                batch_result = rtsp.get_batch(camera_ids, timeout_ms=5)
-                capture_times.append((time.time() - t_cap) * 1000)
+            else:  # capture_mode == 'cpu'
+                # CPU buffer path
+                _, batch_result, cap_time = capture_data
+                capture_times.append(cap_time)
 
                 batch_data = batch_result['data']
                 valid_mask = batch_result['valid_mask']
-
-                if batch_result['valid_count'] == 0:
-                    # DEBUG: Print every 100 attempts to see if we're stuck
-                    if frame_counter % 100 == 0:
-                        print(f"[DEBUG] Waiting for frames... (no valid frames received yet)")
-                    time.sleep(0.001)
-                    continue
-
                 frame_width = batch_result['width']
                 frame_height = batch_result['height']
                 is_nv12 = batch_result['format'] == 'NV12'
@@ -360,7 +420,7 @@ def main():
                             bgr_frames.append(frame_data)
                             valid_indices.append(camera_ids[i])
                         elif is_nv12 or len(frame_data.shape) == 2:
-                            # NV12 format - use new direct path (Fix #1)
+                            # NV12 format - use new direct path
                             nv12_frames.append(frame_data)
                             valid_indices.append(camera_ids[i])
 
@@ -371,11 +431,10 @@ def main():
                 t0 = time.time()
 
                 if nv12_frames:
-                    # FIX #1: Direct NV12 to GPU - skip CPU color conversion!
+                    # Direct NV12 to GPU - skip CPU color conversion!
                     batch_results = detector.detect_batch_nv12(nv12_frames, frame_width, frame_height)
 
-                    # Convert NV12 to BGR for display (still needed for visualization)
-                    # But this is now OFF the critical path - inference already done
+                    # Convert NV12 to BGR for display (off the critical path)
                     display_bgr_frames = []
                     for nv12_frame in nv12_frames:
                         bgr = cv2.cvtColor(nv12_frame, cv2.COLOR_YUV2BGR_NV12)
@@ -387,10 +446,9 @@ def main():
 
                 inference_times.append((time.time() - t0) * 1000)
 
-                # Store results - send full-res frames to display thread (Fix #2)
+                # Store results
                 for i, (idx, detections) in enumerate(zip(valid_indices, batch_results)):
                     last_detections[idx] = detections
-                    # Send full-res frame + detections to display thread
                     last_frame_data[idx] = (display_bgr_frames[i], detections)
 
                 frame_counter += len(valid_indices)
@@ -428,6 +486,11 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
+        # Stop capture thread
+        capture_running.clear()
+        if capture_thread.is_alive():
+            capture_thread.join(timeout=1.0)
+
         display_thread.stop()
         rtsp.stop()
         print("Done.")
