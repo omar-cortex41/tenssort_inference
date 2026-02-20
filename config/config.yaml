@@ -1,9 +1,14 @@
 model:
-  engine_path: ../models/yolo26m_fp16_dynamic.engine
-  conf_threshold: 0.6
+  engine_path: ../models/yolo26m_int8_dynamic.engine
+  conf_threshold: 0.25
   nms_threshold: 0.45
   input_width: 640
   input_height: 640
+
+# Batching settings (must match engine dynamic batch range)
+batching:
+  min_batch_size: 8  # Always wait for all 8 streams for optimal performance
+  max_batch_size: 8  # Process exactly 8 frames (matches INT8 engine optimal batch)
 
 # Display settings
 display:
@@ -99,26 +104,26 @@ tracking:
   - person
 streams:
 - id: 0
-  source: ../videos/vid1.mp4
+  source: ../videos/vid5.mp4
   name: Stream 1
 - id: 1
-  source: ../videos/vid2.mp4
+  source: ../videos/vid5.mp4
   name: Stream 2
 - id: 2
-  source: ../videos/vid3.mp4
+  source: ../videos/vid5.mp4
   name: Stream 3
 - id: 3
-  source: ../videos/vid4.mp4
+  source: ../videos/vid5.mp4
   name: Stream 4
 - id: 4
   source: ../videos/vid5.mp4
   name: Stream 5
 - id: 5
-  source: ../videos/vid6.mp4
+  source: ../videos/vid5.mp4
   name: Stream 6
 - id: 6
-  source: ../videos/vid7.mp4
+  source: ../videos/vid5.mp4
   name: Stream 7
 - id: 7
-  source: ../videos/vid8.mp4
+  source: ../videos/vid5.mp4
   name: Stream 8

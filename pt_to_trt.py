@@ -2,7 +2,7 @@ import subprocess
 import sys
 import argparse
 
-MODEL_PATH = "models/yolo26n.pt"
+MODEL_PATH = "models/yolo26m.pt"
 
 
 def convert_pt_to_onnx(model_path: str, dynamic: bool = False) -> str:

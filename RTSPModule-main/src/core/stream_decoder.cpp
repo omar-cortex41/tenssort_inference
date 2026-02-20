@@ -219,29 +219,13 @@ bool StreamDecoder::create() {
     if (nvv4l2_factory) {
       gst_object_unref(nvv4l2_factory);
       
-      // Check for NVIDIA driver - /dev/nvidia0 confirms driver is loaded
-      // Note: /dev/video* are V4L2 capture devices (webcams), NOT related to NVDEC
-      bool nvidia_driver_available = false;
-      FILE* fp = fopen("/dev/nvidia0", "r");
-      if (fp) {
-        fclose(fp);
-        nvidia_driver_available = true;
-      }
-      
-      if (!nvidia_driver_available) {
-        std::cout << "[" << id_ << "] NVIDIA driver not available (/dev/nvidia0 missing) - skipping nvv4l2decoder" << std::endl;
+      // Try NVMM hardware decoding (works in WSL with DeepStream)
+      convert = gst_element_factory_make("nvvideoconvert", ("convert-" + id_str).c_str());
+      if (convert) {
+        use_nvmm_memory_ = true;
+        std::cout << "[" << id_ << "] Using DeepStream NVMM path (nvvideoconvert)" << std::endl;
         if (logger_) {
-          logger_->logInfo("NVIDIA driver not found, falling back to software decoder");
-        }
-        hardware_accel_failed_ = true;  // Force CPU fallback
-      } else {
-        convert = gst_element_factory_make("nvvideoconvert", ("convert-" + id_str).c_str());
-        if (convert) {
-          use_nvmm_memory_ = true;
-          std::cout << "[" << id_ << "] Using DeepStream NVMM path (nvvideoconvert)" << std::endl;
-          if (logger_) {
-            logger_->logInfo("Converter selected: nvvideoconvert (DeepStream NVMM)");
-          }
+          logger_->logInfo("Converter selected: nvvideoconvert (DeepStream NVMM)");
         }
       }
     }

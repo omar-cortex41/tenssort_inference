@@ -323,8 +323,10 @@ def main():
                         capture_queue.put(('gpu', gpu_ptrs, widths, heights, valid_indices, cap_time), timeout=0.1)
                 else:
                     # CPU buffer path with dynamic batching
-                    MIN_BATCH_SIZE = 4
-                    MAX_BATCH_SIZE = 12
+                    # Read batch sizes from config
+                    batching_config = config.get('batching', {})
+                    MIN_BATCH_SIZE = batching_config.get('min_batch_size', 4)
+                    MAX_BATCH_SIZE = batching_config.get('max_batch_size', 12)
 
                     batch_result = rtsp.get_batch(camera_ids, timeout_ms=2)
                     valid_count = batch_result['valid_count']
