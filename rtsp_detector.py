@@ -10,16 +10,6 @@ import yaml
 import hashlib
 from collections import deque
 
-# CPU affinity helper
-def set_thread_affinity(cpu_cores):
-    """Pin current thread to specific CPU cores"""
-    try:
-        os.sched_setaffinity(0, cpu_cores)
-        return True
-    except (AttributeError, OSError):
-        # Not supported on this platform or insufficient permissions
-        return False
-
 # Add TRT detector path
 sys.path.insert(0, 'trt_detector/build')
 from trt_detector import DetectorService, ModelConfig
@@ -71,9 +61,6 @@ class DisplayThread:
         self.thread.start()
 
     def _run(self):
-        # Pin display thread to CPU cores 0-1
-        set_thread_affinity({0, 1})
-
         while self.running:
             try:
                 frame_data, stats = self.queue.get(timeout=0.1)
@@ -194,10 +181,6 @@ def generate_rtsp_config(streams, output_path):
 
 
 def main():
-    # Pin main inference thread to CPU cores 4-11 (leave 0-3 for capture/display)
-    if set_thread_affinity({4, 5, 6, 7, 8, 9, 10, 11}):
-        print("[PERF] Main thread pinned to CPU cores 4-11")
-
     if not RTSP_MODULE_AVAILABLE:
         print("ERROR: RTSPModule is required but not available.")
         print("\nTo build RTSPModule:")
@@ -320,9 +303,6 @@ def main():
 
     def capture_worker():
         """Dedicated capture thread - always grabbing frames"""
-        # Pin capture thread to CPU cores 2-3
-        set_thread_affinity({2, 3})
-
         while capture_running.is_set():
             try:
                 t_cap = time.time()

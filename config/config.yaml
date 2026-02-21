@@ -10,7 +10,7 @@ model:
 batching:
   min_batch_size: 1  # Process immediately - don't wait (low latency for RTSP)
   max_batch_size: 8  # Still batch up to 8 when frames arrive together
-  timeout_ms: 0      # Immediate batching for max throughput (0ms wait)
+  timeout_ms: 2      # How long to wait for more frames (milliseconds)
 
 # Display settings
 display:

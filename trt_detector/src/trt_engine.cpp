@@ -592,7 +592,7 @@ std::vector<std::vector<Detection>> TRTEngine::detectBatchNV12(
         }
     }
 
-    // Postprocess each frame's output
+    // Postprocess each frame's output (CPU - fast and simple)
     std::vector<std::vector<Detection>> results(batch_size);
     for (int i = 0; i < batch_size; ++i) {
         const float* output_offset = h_output_ + i * output_size_per_batch_;
