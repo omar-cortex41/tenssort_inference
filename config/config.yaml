@@ -1,14 +1,16 @@
 model:
-  engine_path: ../models/yolo26m_int8_dynamic.engine
+  engine_path: ../models/yolo26m_fp16_dynamic.engine  #yolo26m_fp16_dynamic.engine   yolo26m_fp16_batch8.engine 
   conf_threshold: 0.25
   nms_threshold: 0.45
   input_width: 640
   input_height: 640
 
 # Batching settings (must match engine dynamic batch range)
+# For RTSP production: prioritize low latency over max throughput
 batching:
-  min_batch_size: 8  # Always wait for all 8 streams for optimal performance
-  max_batch_size: 8  # Process exactly 8 frames (matches INT8 engine optimal batch)
+  min_batch_size: 1  # Process immediately - don't wait (low latency for RTSP)
+  max_batch_size: 8  # Still batch up to 8 when frames arrive together
+  timeout_ms: 0      # Immediate batching for max throughput (0ms wait)
 
 # Display settings
 display:

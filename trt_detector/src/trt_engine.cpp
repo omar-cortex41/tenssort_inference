@@ -31,6 +31,8 @@ TRTEngine::TRTEngine() = default;
 
 TRTEngine::~TRTEngine() {
     freeBuffers();
+    if (cuda_graph_exec_) cudaGraphExecDestroy(cuda_graph_exec_);
+    if (cuda_graph_) cudaGraphDestroy(cuda_graph_);
     if (context_) delete context_;
     if (engine_) delete engine_;
     if (runtime_) delete runtime_;
@@ -40,7 +42,11 @@ TRTEngine::~TRTEngine() {
 TRTEngine::TRTEngine(TRTEngine&& other) noexcept
     : config_(std::move(other.config_))
     , runtime_(other.runtime_), engine_(other.engine_), context_(other.context_)
-    , stream_(other.stream_), h_output_(other.h_output_)
+    , stream_(other.stream_)
+    , cuda_graph_(other.cuda_graph_), cuda_graph_exec_(other.cuda_graph_exec_)
+    , graph_batch_size_(other.graph_batch_size_), use_cuda_graphs_(other.use_cuda_graphs_)
+    , warmup_count_(other.warmup_count_)
+    , h_output_(other.h_output_)
     , d_input_(other.d_input_), d_output_(other.d_output_)
     , d_src_batch_(std::move(other.d_src_batch_))
     , h_src_batch_(std::move(other.h_src_batch_))
@@ -58,6 +64,8 @@ TRTEngine::TRTEngine(TRTEngine&& other) noexcept
     other.engine_ = nullptr;
     other.context_ = nullptr;
     other.stream_ = nullptr;
+    other.cuda_graph_ = nullptr;
+    other.cuda_graph_exec_ = nullptr;
     other.h_output_ = nullptr;
     other.d_input_ = other.d_output_ = nullptr;
 }
@@ -65,6 +73,8 @@ TRTEngine::TRTEngine(TRTEngine&& other) noexcept
 TRTEngine& TRTEngine::operator=(TRTEngine&& other) noexcept {
     if (this != &other) {
         freeBuffers();
+        if (cuda_graph_exec_) cudaGraphExecDestroy(cuda_graph_exec_);
+        if (cuda_graph_) cudaGraphDestroy(cuda_graph_);
         if (context_) delete context_;
         if (engine_) delete engine_;
         if (runtime_) delete runtime_;
@@ -72,7 +82,11 @@ TRTEngine& TRTEngine::operator=(TRTEngine&& other) noexcept {
 
         config_ = std::move(other.config_);
         runtime_ = other.runtime_; engine_ = other.engine_; context_ = other.context_;
-        stream_ = other.stream_; h_output_ = other.h_output_;
+        stream_ = other.stream_;
+        cuda_graph_ = other.cuda_graph_; cuda_graph_exec_ = other.cuda_graph_exec_;
+        graph_batch_size_ = other.graph_batch_size_; use_cuda_graphs_ = other.use_cuda_graphs_;
+        warmup_count_ = other.warmup_count_;
+        h_output_ = other.h_output_;
         d_input_ = other.d_input_; d_output_ = other.d_output_;
         d_src_batch_ = std::move(other.d_src_batch_);
         h_src_batch_ = std::move(other.h_src_batch_);
@@ -89,6 +103,8 @@ TRTEngine& TRTEngine::operator=(TRTEngine&& other) noexcept {
         other.engine_ = nullptr;
         other.context_ = nullptr;
         other.stream_ = nullptr;
+        other.cuda_graph_ = nullptr;
+        other.cuda_graph_exec_ = nullptr;
         other.h_output_ = nullptr;
         other.d_input_ = other.d_output_ = nullptr;
     }
@@ -409,7 +425,6 @@ std::vector<std::vector<Detection>> TRTEngine::detectBatchGpuNV12(
 
     // Postprocess each frame's output
     std::vector<std::vector<Detection>> results(batch_size);
-
     for (int i = 0; i < batch_size; ++i) {
         const float* output_offset = h_output_ + i * output_size_per_batch_;
         results[i] = Postprocessor::process(
@@ -420,7 +435,6 @@ std::vector<std::vector<Detection>> TRTEngine::detectBatchGpuNV12(
             widths[i], heights[i], config_.class_names
         );
     }
-
     return results;
 }
 
@@ -444,14 +458,18 @@ std::vector<std::vector<Detection>> TRTEngine::detectBatchNV12(
     std::vector<int> pad_xs(batch_size);
     std::vector<int> pad_ys(batch_size);
 
-    // Set dynamic input shape for this batch
-    nvinfer1::Dims input_dims;
-    input_dims.nbDims = 4;
-    input_dims.d[0] = batch_size;
-    input_dims.d[1] = 3;
-    input_dims.d[2] = config_.input_height;
-    input_dims.d[3] = config_.input_width;
-    context_->setInputShape(input_name_.c_str(), input_dims);
+    // Set dynamic input shape for this batch (only if changed to avoid redundant calls)
+    static int last_batch_size = -1;
+    if (batch_size != last_batch_size) {
+        nvinfer1::Dims input_dims;
+        input_dims.nbDims = 4;
+        input_dims.d[0] = batch_size;
+        input_dims.d[1] = 3;
+        input_dims.d[2] = config_.input_height;
+        input_dims.d[3] = config_.input_width;
+        context_->setInputShape(input_name_.c_str(), input_dims);
+        last_batch_size = batch_size;
+    }
 
     // Upload NV12 frames to GPU and preprocess in PARALLEL
     // Fix #4: Use pinned staging buffers for faster H2D transfer
@@ -482,23 +500,100 @@ std::vector<std::vector<Detection>> TRTEngine::detectBatchNV12(
     for (int i = 0; i < batch_size; ++i) {
         cudaEventRecord(preprocess_events_[i], preprocess_streams_[i]);
     }
+    // Synchronize all preprocessing before inference
+    // Note: For CUDA graphs, we must fully synchronize preprocess streams before capture
     for (int i = 0; i < batch_size; ++i) {
-        cudaStreamWaitEvent(stream_, preprocess_events_[i], 0);
+        cudaEventSynchronize(preprocess_events_[i]);  // Wait for preprocess to complete
     }
 
-    // Run inference
-    context_->setTensorAddress(input_name_.c_str(), d_input_);
-    context_->setTensorAddress(output_name_.c_str(), d_output_);
-    context_->enqueueV3(stream_);
-
-    // Copy output back
+    // Run inference with CUDA Graphs (Phase 2 optimization)
     size_t output_bytes = output_size_per_batch_ * batch_size * sizeof(float);
-    cudaMemcpyAsync(h_output_, d_output_, output_bytes, cudaMemcpyDeviceToHost, stream_);
-    cudaStreamSynchronize(stream_);
+
+    static int replay_count = 0;  // Debug counter
+    if (use_cuda_graphs_ && cuda_graph_exec_ && batch_size == graph_batch_size_) {
+        // Graph is already recorded for this batch size - replay it (FAST!)
+        if (replay_count == 0) {
+            std::cout << "[TRTEngine] Now replaying CUDA graph (silent from now on)" << std::endl;
+        }
+        replay_count++;
+
+        // CRITICAL: Update tensor addresses BEFORE replaying graph
+        // The graph captures the enqueueV3 call, but we need fresh data pointers
+        context_->setTensorAddress(input_name_.c_str(), d_input_);
+        context_->setTensorAddress(output_name_.c_str(), d_output_);
+
+        cudaGraphLaunch(cuda_graph_exec_, stream_);
+        cudaStreamSynchronize(stream_);
+    } else if (use_cuda_graphs_ && warmup_count_ >= WARMUP_ITERATIONS && !cuda_graph_exec_) {
+        // Warmup complete - record the graph once
+        std::cout << "[TRTEngine] Recording CUDA graph for batch=" << batch_size
+                  << " (warmup=" << warmup_count_ << ", has_graph=" << (cuda_graph_exec_ != nullptr) << ")" << std::endl;
+
+        // Begin graph capture (only inference + D2H copy, preprocess already done)
+        cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal);
+
+        // Capture inference + D2H copy
+        context_->setTensorAddress(input_name_.c_str(), d_input_);
+        context_->setTensorAddress(output_name_.c_str(), d_output_);
+        context_->enqueueV3(stream_);
+        cudaMemcpyAsync(h_output_, d_output_, output_bytes, cudaMemcpyDeviceToHost, stream_);
+
+        // End capture and instantiate graph
+        cudaError_t captureResult = cudaStreamEndCapture(stream_, &cuda_graph_);
+        if (captureResult != cudaSuccess) {
+            std::cerr << "[TRTEngine] CUDA graph capture failed: " << cudaGetErrorString(captureResult) << std::endl;
+            cuda_graph_ = nullptr;
+        } else {
+            cudaError_t instantiateResult = cudaGraphInstantiate(&cuda_graph_exec_, cuda_graph_, nullptr, nullptr, 0);
+            if (instantiateResult != cudaSuccess) {
+                std::cerr << "[TRTEngine] CUDA graph instantiation failed: " << cudaGetErrorString(instantiateResult) << std::endl;
+                cudaGraphDestroy(cuda_graph_);
+                cuda_graph_ = nullptr;
+                cuda_graph_exec_ = nullptr;
+            }
+        }
+
+        if (cuda_graph_exec_) {
+            // Launch the newly recorded graph
+            cudaGraphLaunch(cuda_graph_exec_, stream_);
+            cudaStreamSynchronize(stream_);
+
+            graph_batch_size_ = batch_size;
+            std::cout << "[TRTEngine] CUDA graph recorded successfully! (ptr=" << cuda_graph_exec_ << ")" << std::endl;
+        }
+    } else {
+        // Warmup phase or batch size mismatch - run normally
+        if (cuda_graph_exec_ && batch_size != graph_batch_size_) {
+            // Batch size changed, destroy old graph
+            std::cout << "[TRTEngine] Batch size changed from " << graph_batch_size_
+                      << " to " << batch_size << ", destroying old CUDA graph" << std::endl;
+            cudaGraphExecDestroy(cuda_graph_exec_);
+            cudaGraphDestroy(cuda_graph_);
+            cuda_graph_exec_ = nullptr;
+            cuda_graph_ = nullptr;
+            graph_batch_size_ = batch_size;
+            warmup_count_ = 1;
+        }
+
+        context_->setTensorAddress(input_name_.c_str(), d_input_);
+        context_->setTensorAddress(output_name_.c_str(), d_output_);
+        context_->enqueueV3(stream_);
+        cudaMemcpyAsync(h_output_, d_output_, output_bytes, cudaMemcpyDeviceToHost, stream_);
+        cudaStreamSynchronize(stream_);
+
+        // Track warmup iterations for this batch size
+        if (!cuda_graph_exec_) {
+            if (graph_batch_size_ == batch_size) {
+                warmup_count_++;
+            } else {
+                graph_batch_size_ = batch_size;
+                warmup_count_ = 1;
+            }
+        }
+    }
 
     // Postprocess each frame's output
     std::vector<std::vector<Detection>> results(batch_size);
-
     for (int i = 0; i < batch_size; ++i) {
         const float* output_offset = h_output_ + i * output_size_per_batch_;
         results[i] = Postprocessor::process(
@@ -509,7 +604,6 @@ std::vector<std::vector<Detection>> TRTEngine::detectBatchNV12(
             widths[i], heights[i], config_.class_names
         );
     }
-
     return results;
 }
 

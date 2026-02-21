@@ -2,7 +2,7 @@ import subprocess
 import sys
 import argparse
 
-MODEL_PATH = "models/yolo26m.pt"
+MODEL_PATH = "../models/yolo26m.pt"
 
 
 def convert_pt_to_onnx(model_path: str, dynamic: bool = False) -> str:
@@ -38,20 +38,39 @@ model.export(format="onnx")
     return onnx_path
 
 
-def convert_onnx_to_engine(onnx_path: str, fp16: bool = True, max_batch: int = None) -> str:
+def convert_onnx_to_engine(onnx_path: str, fp16: bool = True, max_batch: int = None, fixed_batch: int = None) -> str:
     """Convert ONNX model to TensorRT engine.
 
     Args:
         onnx_path: Path to ONNX model
         fp16: Use FP16 precision (faster, slightly less accurate)
         max_batch: If set, build dynamic batch engine with range [1, max_batch]
+        fixed_batch: If set, build fixed batch engine (for CUDA graphs)
 
     Returns:
         Path to TensorRT engine
     """
     precision = "fp16" if fp16 else "fp32"
 
-    if max_batch:
+    if fixed_batch:
+        # Fixed batch engine (for CUDA graphs - no dynamic shapes)
+        engine_path = onnx_path.replace('.onnx', f'_{precision}_batch{fixed_batch}.engine')
+
+        # Build with fixed shape
+        shape = f"images:{fixed_batch}x3x640x640"
+
+        command = [
+            "trtexec",
+            f"--onnx={onnx_path}",
+            f"--saveEngine={engine_path}",
+            f"--shapes={shape}",
+        ]
+
+        if fp16:
+            command.append("--fp16")
+
+        print(f"Building FIXED batch={fixed_batch} engine (CUDA graph compatible)")
+    elif max_batch:
         # Dynamic batch engine
         engine_path = onnx_path.replace('.onnx', f'_{precision}_dynamic.engine')
 
@@ -121,27 +140,42 @@ Examples:
              "Optimal batch is set to MAX_BATCH/2."
     )
 
+    parser.add_argument(
+        "--batch",
+        type=int,
+        metavar="BATCH_SIZE",
+        help="Build FIXED batch engine (required for CUDA graphs). "
+             "Example: --batch 8 for always-8-frames batching."
+    )
+
     args = parser.parse_args()
+
+    # Validate arguments
+    if args.dynamic and args.batch:
+        parser.error("Cannot use both --dynamic and --batch. Choose one.")
 
     # Step 1: Convert PT to ONNX
     print("=" * 60)
     print("Step 1: Converting PyTorch to ONNX")
     print("=" * 60)
-    onnx_path = convert_pt_to_onnx(MODEL_PATH, dynamic=args.dynamic is not None)
+    is_dynamic = args.dynamic is not None or args.batch is not None
+    onnx_path = convert_pt_to_onnx(MODEL_PATH, dynamic=is_dynamic)
 
     # Step 2: Convert ONNX to TensorRT
     print()
     print("=" * 60)
     print("Step 2: Converting ONNX to TensorRT")
     print("=" * 60)
-    engine_path = convert_onnx_to_engine(onnx_path, fp16=args.fp16, max_batch=args.dynamic)
+    engine_path = convert_onnx_to_engine(onnx_path, fp16=args.fp16, max_batch=args.dynamic, fixed_batch=args.batch)
 
     print()
     print("=" * 60)
     print("Done!")
     print("=" * 60)
     print(f"Engine: {engine_path}")
-    if args.dynamic:
+    if args.batch:
+        print(f"Batch: {args.batch} (FIXED - CUDA graph compatible)")
+    elif args.dynamic:
         print(f"Batch range: 1 to {args.dynamic}")
     else:
         print("Batch: 1 (static)")

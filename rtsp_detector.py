@@ -10,6 +10,16 @@ import yaml
 import hashlib
 from collections import deque
 
+# CPU affinity helper
+def set_thread_affinity(cpu_cores):
+    """Pin current thread to specific CPU cores"""
+    try:
+        os.sched_setaffinity(0, cpu_cores)
+        return True
+    except (AttributeError, OSError):
+        # Not supported on this platform or insufficient permissions
+        return False
+
 # Add TRT detector path
 sys.path.insert(0, 'trt_detector/build')
 from trt_detector import DetectorService, ModelConfig
@@ -61,6 +71,9 @@ class DisplayThread:
         self.thread.start()
 
     def _run(self):
+        # Pin display thread to CPU cores 0-1
+        set_thread_affinity({0, 1})
+
         while self.running:
             try:
                 frame_data, stats = self.queue.get(timeout=0.1)
@@ -181,6 +194,10 @@ def generate_rtsp_config(streams, output_path):
 
 
 def main():
+    # Pin main inference thread to CPU cores 4-11 (leave 0-3 for capture/display)
+    if set_thread_affinity({4, 5, 6, 7, 8, 9, 10, 11}):
+        print("[PERF] Main thread pinned to CPU cores 4-11")
+
     if not RTSP_MODULE_AVAILABLE:
         print("ERROR: RTSPModule is required but not available.")
         print("\nTo build RTSPModule:")
@@ -277,6 +294,10 @@ def main():
     fps_start_time = time.time()
     current_fps = 0.0
 
+    # Per-stream latency tracking for RTSP production
+    stream_latencies = [deque(maxlen=30) for _ in range(num_streams)]
+    stream_frame_times = [time.time()] * num_streams
+
     # Display frame skip (from config)
     display_config = config.get('display', {})
     frame_skip = display_config.get('frame_skip', 1)
@@ -299,6 +320,9 @@ def main():
 
     def capture_worker():
         """Dedicated capture thread - always grabbing frames"""
+        # Pin capture thread to CPU cores 2-3
+        set_thread_affinity({2, 3})
+
         while capture_running.is_set():
             try:
                 t_cap = time.time()
@@ -327,8 +351,9 @@ def main():
                     batching_config = config.get('batching', {})
                     MIN_BATCH_SIZE = batching_config.get('min_batch_size', 4)
                     MAX_BATCH_SIZE = batching_config.get('max_batch_size', 12)
+                    BATCH_TIMEOUT_MS = batching_config.get('timeout_ms', 2)
 
-                    batch_result = rtsp.get_batch(camera_ids, timeout_ms=2)
+                    batch_result = rtsp.get_batch(camera_ids, timeout_ms=BATCH_TIMEOUT_MS)
                     valid_count = batch_result['valid_count']
 
                     if valid_count == 0:
@@ -336,8 +361,9 @@ def main():
                         continue
 
                     # Try to batch up more frames if we have too few
-                    if valid_count < MIN_BATCH_SIZE:
-                        extra_result = rtsp.get_batch(camera_ids, timeout_ms=1)
+                    # Skip extra batching if min_batch_size=1 (low-latency mode)
+                    if valid_count < MIN_BATCH_SIZE and MIN_BATCH_SIZE > 1:
+                        extra_result = rtsp.get_batch(camera_ids, timeout_ms=max(1, BATCH_TIMEOUT_MS // 2))
                         if extra_result['valid_count'] > 0:
                             for i in range(len(camera_ids)):
                                 if extra_result['valid_mask'][i] and not batch_result['valid_mask'][i]:
@@ -389,6 +415,11 @@ def main():
                 # Store results (no display frames in zero-copy mode)
                 for idx, detections in zip(valid_indices, batch_results):
                     last_detections[idx] = detections
+                    # Track per-stream latency
+                    now = time.time()
+                    stream_latency = (now - stream_frame_times[idx]) * 1000
+                    stream_latencies[idx].append(stream_latency)
+                    stream_frame_times[idx] = now
                     # Create placeholder for display
                     placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
                     cv2.putText(placeholder, f"Cam {idx} (GPU Zero-Copy)", (10, 30),
@@ -451,6 +482,11 @@ def main():
                 # Store results
                 for i, (idx, detections) in enumerate(zip(valid_indices, batch_results)):
                     last_detections[idx] = detections
+                    # Track per-stream latency
+                    now = time.time()
+                    stream_latency = (now - stream_frame_times[idx]) * 1000
+                    stream_latencies[idx].append(stream_latency)
+                    stream_frame_times[idx] = now
                     last_frame_data[idx] = (display_bgr_frames[i], detections)
 
                 frame_counter += len(valid_indices)
@@ -461,19 +497,30 @@ def main():
             avg_capture = sum(capture_times) / len(capture_times) if capture_times else 0
             per_stream_fps = current_fps / len(camera_ids) if camera_ids else 0
 
+            # Calculate per-stream latency stats
+            stream_latency_avgs = []
+            for latencies in stream_latencies:
+                if latencies:
+                    stream_latency_avgs.append(sum(latencies) / len(latencies))
+            avg_stream_latency = sum(stream_latency_avgs) / len(stream_latency_avgs) if stream_latency_avgs else 0
+            max_stream_latency = max(stream_latency_avgs) if stream_latency_avgs else 0
+            min_stream_latency = min(stream_latency_avgs) if stream_latency_avgs else 0
+
             if elapsed_total >= 1.0:
                 current_fps = frame_counter / elapsed_total
                 frame_counter = 0
                 fps_start_time = time.time()
                 per_stream_fps = current_fps / len(camera_ids) if camera_ids else 0
 
-                # OPTIMIZATION: Enhanced performance stats
+                # OPTIMIZATION: Enhanced performance stats with per-stream latency
                 mode = 'GPU Zero-Copy' if use_zero_copy else 'NV12 Direct'
                 total_latency = avg_capture + avg_inference
                 gpu_util_estimate = (avg_inference / 16.6) * 100  # % of 60Hz frame time
                 print(f"\r[PERF] FPS: {current_fps:.1f} total | {per_stream_fps:.1f}/stream | "
                       f"Inf: {avg_inference:.1f}ms | Cap: {avg_capture:.1f}ms | "
-                      f"Latency: {total_latency:.1f}ms | GPU~{gpu_util_estimate:.0f}% | Mode: {mode}   ", end='', flush=True)
+                      f"Latency: {total_latency:.1f}ms | Stream Lat: {avg_stream_latency:.1f}ms "
+                      f"(min:{min_stream_latency:.1f} max:{max_stream_latency:.1f}) | "
+                      f"GPU~{gpu_util_estimate:.0f}% | Mode: {mode}   ", end='', flush=True)
 
             # === DISPLAY (with frame skip) ===
             display_frame_counter += 1

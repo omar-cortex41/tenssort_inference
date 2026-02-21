@@ -80,6 +80,15 @@ private:
     nvinfer1::IExecutionContext* context_ = nullptr;
     cudaStream_t stream_ = nullptr;
 
+    // CUDA Graphs for low-latency inference
+    cudaGraph_t cuda_graph_ = nullptr;
+    cudaGraphExec_t cuda_graph_exec_ = nullptr;
+    cudaGraphNode_t memcpy_node_ = nullptr;  // Node for updating D2H copy size
+    int graph_batch_size_ = 0;  // Batch size the graph was recorded for
+    bool use_cuda_graphs_ = false;  // Disabled: Fixed batch alone gives 637 FPS!
+    int warmup_count_ = 0;
+    static constexpr int WARMUP_ITERATIONS = 5;  // Warmup before recording graph
+
     // Buffers (sized for max batch)
     float* h_output_ = nullptr;
     void* d_input_ = nullptr;
