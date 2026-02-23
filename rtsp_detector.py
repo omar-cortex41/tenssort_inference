@@ -221,32 +221,24 @@ def main():
                         cap_time = (time.time() - t_cap) * 1000
                         capture_queue.put(('gpu', gpu_ptrs, widths, heights, valid_indices, cap_time), timeout=0.1)
                 else:
-                    # CPU buffer path with dynamic batching
-                    # Read batch sizes from config
+                    # CPU buffer path with adaptive batching (C++ implementation)
+                    # Read batch configuration from config
                     batching_config = config.get('batching', {})
                     MIN_BATCH_SIZE = batching_config.get('min_batch_size', 4)
                     MAX_BATCH_SIZE = batching_config.get('max_batch_size', 12)
                     BATCH_TIMEOUT_MS = batching_config.get('timeout_ms', 2)
+                    RETRY_TIMEOUT_MS = max(1, BATCH_TIMEOUT_MS // 2)
 
-                    batch_result = rtsp.get_batch(camera_ids, timeout_ms=BATCH_TIMEOUT_MS)
+                    # Use new C++ adaptive batching - automatically retries to meet min_batch_size
+                    batch_result = rtsp.get_batch_adaptive(
+                        camera_ids,
+                        min_batch_size=MIN_BATCH_SIZE,
+                        max_batch_size=MAX_BATCH_SIZE,
+                        timeout_ms=BATCH_TIMEOUT_MS,
+                        retry_timeout_ms=RETRY_TIMEOUT_MS
+                    )
+
                     valid_count = batch_result['valid_count']
-
-                    if valid_count == 0:
-                        time.sleep(0.001)
-                        continue
-
-                    # Try to batch up more frames if we have too few
-                    # Skip extra batching if min_batch_size=1 (low-latency mode)
-                    if valid_count < MIN_BATCH_SIZE and MIN_BATCH_SIZE > 1:
-                        extra_result = rtsp.get_batch(camera_ids, timeout_ms=max(1, BATCH_TIMEOUT_MS // 2))
-                        if extra_result['valid_count'] > 0:
-                            for i in range(len(camera_ids)):
-                                if extra_result['valid_mask'][i] and not batch_result['valid_mask'][i]:
-                                    batch_result['data'][i] = extra_result['data'][i]
-                                    batch_result['valid_mask'][i] = True
-                                    valid_count += 1
-                                    if valid_count >= MAX_BATCH_SIZE:
-                                        break
 
                     if valid_count < MIN_BATCH_SIZE:
                         time.sleep(0.001)

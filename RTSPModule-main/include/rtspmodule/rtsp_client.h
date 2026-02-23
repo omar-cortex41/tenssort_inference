@@ -60,6 +60,10 @@ public:
   // Returns fixed-size batch with valid_mask indicating which frames succeeded
   FrameBatch getBatchedFrames(const BatchConfig& config);
 
+  // Adaptive Batch Retrieval - automatically retries to meet min_batch_size
+  // Returns batch with at least min_batch_size valid frames (or all available if less)
+  FrameBatch getBatchedFramesAdaptive(const AdaptiveBatchConfig& config);
+
   // -------------------------------------------------------------------------
   // WebRTC streaming control — fully independent per stream, hot-switchable
   // -------------------------------------------------------------------------

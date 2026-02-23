@@ -383,6 +383,163 @@ public:
     return result;
   }
 
+  // Adaptive Batch Frame Retrieval - automatically retries to meet min_batch_size
+  // ZERO-COPY: Same as get_batch but with automatic retry logic for insufficient frames
+  py::dict get_batch_adaptive(py::list camera_ids,
+                              int min_batch_size = 1,
+                              int max_batch_size = 8,
+                              int timeout_ms = 10,
+                              int retry_timeout_ms = 5) {
+
+    // Validate buffer mode
+    if (!client_.isCpuBufferEnabled()) {
+      throw std::runtime_error(
+          "get_batch_adaptive() requires cpu_buffer_enabled=true in config. "
+          "Set cpu_buffer_enabled=true to use adaptive batch retrieval.");
+    }
+
+    // Build config from Python list
+    AdaptiveBatchConfig config;
+    config.min_batch_size = min_batch_size;
+    config.max_batch_size = max_batch_size;
+    config.timeout_ms = timeout_ms;
+    config.retry_timeout_ms = retry_timeout_ms;
+
+    for (auto item : camera_ids) {
+      config.camera_ids.push_back(item.cast<int>());
+    }
+
+    size_t batch_size = config.camera_ids.size();
+    if (batch_size == 0) {
+      py::dict result;
+      result["data"] = py::none();
+      result["valid_mask"] = py::array_t<bool>(0);
+      result["metadata"] = py::list();
+      result["count"] = 0;
+      result["valid_count"] = 0;
+      return result;
+    }
+
+    // Get expected dimensions from first valid frame
+    int width = 0, height = 0;
+    std::string format = "BGR";
+    double bytes_per_pixel = 3.0;
+
+    for (size_t i = 0; i < batch_size && width == 0; ++i) {
+      int cam_id = config.camera_ids[i];
+      if (cam_id >= 0 && cam_id < client_.getStreamCount()) {
+        auto info = client_.getCpuBufferInfo(cam_id);
+        if (info.buffer_count > 0) {
+          CpuFrame frame = client_.getCpuFrame(cam_id, 0);
+          if (frame.valid) {
+            width = frame.width;
+            height = frame.height;
+            format = frame.format;
+          }
+        }
+      }
+    }
+
+    // Fallback to 1080p if no frames available yet
+    if (width == 0 || height == 0) {
+      width = 1920;
+      height = 1080;
+    }
+
+    // Calculate bytes per pixel based on format
+    if (format == "NV12" || format == "I420") {
+      bytes_per_pixel = 1.5;
+    } else if (format == "RGBA" || format == "BGRA") {
+      bytes_per_pixel = 4.0;
+    }
+
+    size_t frame_size = static_cast<size_t>(width * height * bytes_per_pixel);
+    size_t total_size = batch_size * frame_size;
+
+    // Pre-allocate NumPy array with proper shape
+    py::array_t<uint8_t> arr;
+    if (format == "NV12" || format == "I420") {
+      int h_yuv = static_cast<int>(height * 1.5);
+      arr = py::array_t<uint8_t>({
+        static_cast<py::ssize_t>(batch_size),
+        static_cast<py::ssize_t>(h_yuv),
+        static_cast<py::ssize_t>(width)
+      });
+    } else if (format == "RGBA" || format == "BGRA") {
+      arr = py::array_t<uint8_t>({
+        static_cast<py::ssize_t>(batch_size),
+        static_cast<py::ssize_t>(height),
+        static_cast<py::ssize_t>(width),
+        static_cast<py::ssize_t>(4)
+      });
+    } else {
+      arr = py::array_t<uint8_t>({
+        static_cast<py::ssize_t>(batch_size),
+        static_cast<py::ssize_t>(height),
+        static_cast<py::ssize_t>(width),
+        static_cast<py::ssize_t>(3)
+      });
+    }
+
+    // Get NumPy buffer pointer for zero-copy writes
+    auto buf = arr.request();
+    config.output_ptr = static_cast<uint8_t*>(buf.ptr);
+    config.output_size = total_size;
+    config.target_width = width;
+    config.target_height = height;
+
+    // Zero the buffer for invalid frames
+    std::memset(buf.ptr, 0, total_size);
+
+    FrameBatch batch;
+    {
+      py::gil_scoped_release release;  // Single GIL release for entire adaptive batch operation
+      batch = client_.getBatchedFramesAdaptive(config);
+    }
+
+    py::dict result;
+    result["count"] = batch.batch_size;
+    result["valid_count"] = batch.valid_count;
+    result["format"] = batch.format.empty() ? format : batch.format;
+    result["width"] = batch.width > 0 ? batch.width : width;
+    result["height"] = batch.height > 0 ? batch.height : height;
+    result["data"] = arr;  // Already filled by C++ - no copy!
+
+    // Create valid_mask as NumPy boolean array
+    py::array_t<bool> valid_mask(batch.batch_size > 0 ? batch.batch_size : batch_size);
+    auto mask_buf = valid_mask.request();
+    bool* mask_ptr = static_cast<bool*>(mask_buf.ptr);
+    for (size_t i = 0; i < batch_size; ++i) {
+      mask_ptr[i] = (i < batch.valid_mask.size()) ? batch.valid_mask[i] : false;
+    }
+    result["valid_mask"] = valid_mask;
+
+    // Build metadata list
+    py::list metadata_list;
+    for (size_t i = 0; i < batch_size; ++i) {
+      py::dict meta;
+      if (i < batch.metadata.size()) {
+        meta["camera_id"] = batch.metadata[i].camera_id;
+        meta["frame_id"] = batch.metadata[i].frame_id;
+        meta["timestamp_ns"] = batch.metadata[i].timestamp_ns;
+        meta["width"] = batch.metadata[i].width;
+        meta["height"] = batch.metadata[i].height;
+        meta["valid"] = batch.metadata[i].valid;
+      } else {
+        meta["camera_id"] = config.camera_ids[i];
+        meta["frame_id"] = 0;
+        meta["timestamp_ns"] = 0;
+        meta["width"] = width;
+        meta["height"] = height;
+        meta["valid"] = false;
+      }
+      metadata_list.append(meta);
+    }
+    result["metadata"] = metadata_list;
+
+    return result;
+  }
+
   // Single-camera multi-frame batch retrieval from CPU ring buffer
   // Pops up to num_frames frames from the specified camera's ring buffer (FIFO order)
   py::dict get_multi_frames(int camera_id, int num_frames, int timeout_ms = 10) {
@@ -674,7 +831,41 @@ PYBIND11_MODULE(_core, m) {
            "    frames = result['data']  # shape: (4, H, W, 3) for BGR\n"
            "    valid = result['valid_mask']  # [True, True, False, True]\n"
            "    # Offline camera 2 has zeroed (black) frame")
-      
+
+      .def("get_batch_adaptive", &FrameProvider::get_batch_adaptive,
+           py::arg("camera_ids"),
+           py::arg("min_batch_size") = 1,
+           py::arg("max_batch_size") = 8,
+           py::arg("timeout_ms") = 10,
+           py::arg("retry_timeout_ms") = 5,
+           "Get frames from multiple cameras with adaptive retry logic.\n\n"
+           "Automatically retries failed cameras with a shorter timeout to meet min_batch_size.\n"
+           "This is ideal for AI inference pipelines that need a minimum batch size for efficiency.\n\n"
+           "Args:\n"
+           "    camera_ids (list[int]): List of camera indices to fetch frames from.\n"
+           "    min_batch_size (int): Minimum valid frames required (will retry if below this, default: 1).\n"
+           "    max_batch_size (int): Maximum valid frames to collect (stops retry early, default: 8).\n"
+           "    timeout_ms (int): Max wait time per frame on first attempt (default: 10).\n"
+           "    retry_timeout_ms (int): Max wait time per frame on retry attempt (default: 5).\n\n"
+           "Returns:\n"
+           "    dict: Batch data with same structure as get_batch():\n"
+           "        - data (numpy.ndarray): Contiguous array with frame data\n"
+           "        - valid_mask (numpy.ndarray[bool]): Boolean array of valid frames\n"
+           "        - metadata (list[dict]): Per-frame metadata\n"
+           "        - count (int): Total batch size\n"
+           "        - valid_count (int): Number of valid frames (>= min_batch_size if possible)\n"
+           "        - width, height (int): Common frame dimensions\n"
+           "        - format (str): Pixel format\n\n"
+           "Example:\n"
+           "    # Retry to get at least 4 valid frames from 8 cameras\n"
+           "    result = provider.get_batch_adaptive([0,1,2,3,4,5,6,7],\n"
+           "                                          min_batch_size=4,\n"
+           "                                          max_batch_size=8,\n"
+           "                                          timeout_ms=2,\n"
+           "                                          retry_timeout_ms=1)\n"
+           "    # If first attempt gets 2 valid frames, retries failed cameras\n"
+           "    # Final result has 4-8 valid frames (or all available if less)")
+
       .def("get_multi_frames", &FrameProvider::get_multi_frames,
            py::arg("camera_id"), py::arg("num_frames"), py::arg("timeout_ms") = 10,
            "Get multiple consecutive frames from a single camera's CPU ring buffer.\n\n"

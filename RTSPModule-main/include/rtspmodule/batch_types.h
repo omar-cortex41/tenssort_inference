@@ -7,7 +7,7 @@
 
 /**
  * @brief Configuration for batch frame retrieval
- * 
+ *
  * Controls which cameras to fetch from and how to handle offline streams.
  */
 struct BatchConfig {
@@ -15,9 +15,30 @@ struct BatchConfig {
     int timeout_ms = 10;            ///< Max wait time per frame (ms)
     int target_width = 0;           ///< Target width for uniformity check (0 = use first valid frame)
     int target_height = 0;          ///< Target height for uniformity check (0 = use first valid frame)
-    
+
     // Zero-copy output (optional): if set, writes directly to external buffer
     uint8_t* output_ptr = nullptr;  ///< External buffer to write frames to (null = use internal buffer)
+    size_t output_size = 0;         ///< Size of external buffer in bytes
+};
+
+/**
+ * @brief Configuration for adaptive batch frame retrieval
+ *
+ * Extends BatchConfig with adaptive batching logic - will automatically
+ * attempt to collect min_batch_size frames, retrying if initial fetch
+ * doesn't have enough valid frames.
+ */
+struct AdaptiveBatchConfig {
+    std::vector<int> camera_ids;    ///< List of camera IDs to fetch frames from
+    int min_batch_size = 1;         ///< Minimum frames required (will retry if below this)
+    int max_batch_size = 8;         ///< Maximum frames to collect
+    int timeout_ms = 10;            ///< Max wait time per frame on first attempt (ms)
+    int retry_timeout_ms = 5;       ///< Max wait time per frame on retry attempt (ms)
+    int target_width = 0;           ///< Target width for uniformity check
+    int target_height = 0;          ///< Target height for uniformity check
+
+    // Zero-copy output (optional)
+    uint8_t* output_ptr = nullptr;  ///< External buffer to write frames to
     size_t output_size = 0;         ///< Size of external buffer in bytes
 };
 

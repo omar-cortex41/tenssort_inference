@@ -628,6 +628,93 @@ FrameBatch RtspClient::getBatchedFrames(const BatchConfig& config) {
   return batch_buffer_;
 }
 
+// Adaptive Batch Frame Retrieval - Retries to meet min_batch_size
+FrameBatch RtspClient::getBatchedFramesAdaptive(const AdaptiveBatchConfig& config) {
+  // Create initial batch config with primary timeout
+  BatchConfig initial_config;
+  initial_config.camera_ids = config.camera_ids;
+  initial_config.timeout_ms = config.timeout_ms;
+  initial_config.target_width = config.target_width;
+  initial_config.target_height = config.target_height;
+  initial_config.output_ptr = config.output_ptr;
+  initial_config.output_size = config.output_size;
+
+  // First attempt - get batch with primary timeout
+  FrameBatch batch = getBatchedFrames(initial_config);
+
+  // Check if we have enough valid frames
+  if ((int)batch.valid_count >= config.min_batch_size ||
+      (int)batch.valid_count >= config.max_batch_size) {
+    return batch;
+  }
+
+  // Not enough frames - retry missing cameras with shorter timeout
+  // Only retry cameras that failed in the first attempt
+  std::vector<int> retry_camera_ids;
+  for (size_t i = 0; i < config.camera_ids.size(); ++i) {
+    if (!batch.valid_mask[i]) {
+      retry_camera_ids.push_back(config.camera_ids[i]);
+    }
+  }
+
+  if (retry_camera_ids.empty()) {
+    return batch;  // All cameras responded, but with insufficient valid frames
+  }
+
+  // Create retry config with shorter timeout
+  BatchConfig retry_config;
+  retry_config.camera_ids = retry_camera_ids;
+  retry_config.timeout_ms = config.retry_timeout_ms;
+  retry_config.target_width = config.target_width > 0 ? config.target_width : batch.width;
+  retry_config.target_height = config.target_height > 0 ? config.target_height : batch.height;
+  retry_config.output_ptr = nullptr;  // Use internal buffer for retry
+  retry_config.output_size = 0;
+
+  // Second attempt - retry failed cameras
+  FrameBatch retry_batch = getBatchedFrames(retry_config);
+
+  // Merge retry results back into original batch
+  // Track retry batch index mapping
+  size_t retry_idx = 0;
+  for (size_t i = 0; i < config.camera_ids.size(); ++i) {
+    if (!batch.valid_mask[i] && retry_idx < retry_batch.batch_size) {
+      // Check if retry succeeded for this camera
+      if (retry_batch.valid_mask[retry_idx]) {
+        // Determine destination pointer
+        uint8_t* dst_ptr = nullptr;
+        if (config.output_ptr != nullptr) {
+          // External buffer - write to correct offset
+          size_t stride = batch.frame_stride > 0 ? batch.frame_stride : retry_batch.frame_stride;
+          dst_ptr = config.output_ptr + (i * stride);
+        } else {
+          // Internal buffer - write to batch_buffer_
+          dst_ptr = batch_buffer_.data.data() + (i * batch_buffer_.frame_stride);
+        }
+
+        // Copy frame data from retry batch
+        const uint8_t* src_ptr = retry_batch.frame_ptr(retry_idx);
+        if (src_ptr && dst_ptr) {
+          size_t copy_size = retry_batch.frame_stride;
+          std::memcpy(dst_ptr, src_ptr, copy_size);
+
+          // Update metadata and mask
+          batch.valid_mask[i] = true;
+          batch.metadata[i] = retry_batch.metadata[retry_idx];
+          batch.valid_count++;
+
+          // Stop if we reached max batch size
+          if ((int)batch.valid_count >= config.max_batch_size) {
+            break;
+          }
+        }
+      }
+      retry_idx++;
+    }
+  }
+
+  return batch;
+}
+
 void RtspClient::initCopyPool() {
   if (copy_pool_running_.exchange(true)) {
     return;  // Already running
