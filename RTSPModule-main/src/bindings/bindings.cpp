@@ -383,10 +383,161 @@ public:
     return result;
   }
 
+  // Single-camera multi-frame batch retrieval from CPU ring buffer
+  // Pops up to num_frames frames from the specified camera's ring buffer (FIFO order)
+  py::dict get_multi_frames(int camera_id, int num_frames, int timeout_ms = 10) {
+    // Validate buffer mode
+    if (!client_.isCpuBufferEnabled()) {
+      throw std::runtime_error(
+          "get_multi_frames() requires cpu_buffer_enabled=true in config. "
+          "Set cpu_buffer_enabled=true to use multi-frame retrieval.");
+    }
+    
+    if (num_frames <= 0) {
+      py::dict result;
+      result["data"] = py::none();
+      result["valid_mask"] = py::array_t<bool>(0);
+      result["metadata"] = py::list();
+      result["count"] = 0;
+      result["valid_count"] = 0;
+      return result;
+    }
+    
+    // Fetch frames from C++ (GIL released)
+    std::vector<CpuFrame> frames;
+    {
+      py::gil_scoped_release release;
+      frames = client_.getCpuFrames(camera_id, num_frames, timeout_ms);
+    }
+    
+    size_t actual_count = frames.size();
+    
+    // Empty result if no frames available
+    if (actual_count == 0) {
+      py::dict result;
+      result["data"] = py::none();
+      result["valid_mask"] = py::array_t<bool>(0);
+      result["metadata"] = py::list();
+      result["count"] = 0;
+      result["valid_count"] = 0;
+      result["width"] = 0;
+      result["height"] = 0;
+      result["format"] = "";
+      return result;
+    }
+    
+    // Use first valid frame to determine dimensions
+    int width = frames[0].width;
+    int height = frames[0].height;
+    std::string format = frames[0].format;
+    
+    // Allocate contiguous NumPy array with proper shape
+    py::array_t<uint8_t> arr;
+    size_t frame_size = 0;
+    
+    if (format == "NV12" || format == "I420") {
+      int h_yuv = static_cast<int>(height * 1.5);
+      frame_size = static_cast<size_t>(h_yuv * width);
+      arr = py::array_t<uint8_t>({
+        static_cast<py::ssize_t>(actual_count),
+        static_cast<py::ssize_t>(h_yuv),
+        static_cast<py::ssize_t>(width)
+      });
+    } else if (format == "RGBA" || format == "BGRA") {
+      frame_size = static_cast<size_t>(height * width * 4);
+      arr = py::array_t<uint8_t>({
+        static_cast<py::ssize_t>(actual_count),
+        static_cast<py::ssize_t>(height),
+        static_cast<py::ssize_t>(width),
+        static_cast<py::ssize_t>(4)
+      });
+    } else {
+      frame_size = static_cast<size_t>(height * width * 3);
+      arr = py::array_t<uint8_t>({
+        static_cast<py::ssize_t>(actual_count),
+        static_cast<py::ssize_t>(height),
+        static_cast<py::ssize_t>(width),
+        static_cast<py::ssize_t>(3)
+      });
+    }
+    
+    auto buf = arr.request();
+    auto* output_ptr = static_cast<uint8_t*>(buf.ptr);
+    std::memset(output_ptr, 0, actual_count * frame_size);
+    
+    // Copy frames + build metadata
+    py::array_t<bool> valid_mask(actual_count);
+    auto mask_buf = valid_mask.request();
+    auto* mask_ptr = static_cast<bool*>(mask_buf.ptr);
+    
+    py::list metadata_list;
+    size_t valid_count = 0;
+    
+    for (size_t i = 0; i < actual_count; ++i) {
+      const auto& frame = frames[i];
+      
+      bool frame_valid = frame.valid && !frame.data.empty() &&
+                         frame.width == width && frame.height == height;
+      mask_ptr[i] = frame_valid;
+      
+      if (frame_valid) {
+        size_t copy_size = std::min(frame.data.size(), frame_size);
+        std::memcpy(output_ptr + (i * frame_size), frame.data.data(), copy_size);
+        valid_count++;
+      }
+      
+      py::dict meta;
+      meta["camera_id"] = camera_id;
+      meta["frame_id"] = frame.frame_id;
+      meta["timestamp_ns"] = frame.timestamp_ns;
+      meta["width"] = frame.width;
+      meta["height"] = frame.height;
+      meta["valid"] = frame_valid;
+      metadata_list.append(meta);
+    }
+    
+    py::dict result;
+    result["data"] = arr;
+    result["valid_mask"] = valid_mask;
+    result["metadata"] = metadata_list;
+    result["count"] = static_cast<int>(actual_count);
+    result["valid_count"] = static_cast<int>(valid_count);
+    result["width"] = width;
+    result["height"] = height;
+    result["format"] = format;
+    
+    return result;
+  }
+
   bool is_cpu_buffer_enabled() const { return client_.isCpuBufferEnabled(); }
   bool is_gpu_available() const { return client_.isGpuAvailable(); }
 
+  // -------------------------------------------------------------------------
+  // WebRTC streaming control — hot-switchable per stream
+  // -------------------------------------------------------------------------
+  bool start_streaming(int camera_id) {
+    py::gil_scoped_release release;
+    return client_.start_streaming(camera_id);
+  }
 
+  void stop_streaming(int camera_id) {
+    py::gil_scoped_release release;
+    client_.stop_streaming(camera_id);
+  }
+
+  void start_streaming_all() {
+    py::gil_scoped_release release;
+    client_.start_streaming_all();
+  }
+
+  void stop_streaming_all() {
+    py::gil_scoped_release release;
+    client_.stop_streaming_all();
+  }
+
+  bool is_webrtc_streaming(int camera_id) const {
+    return client_.isWebRtcStreamingEnabled(camera_id);
+  }
 
 private:
   RtspClient client_;
@@ -522,7 +673,64 @@ PYBIND11_MODULE(_core, m) {
            "    result = provider.get_batch([0, 1, 2, 3], timeout_ms=5)\n"
            "    frames = result['data']  # shape: (4, H, W, 3) for BGR\n"
            "    valid = result['valid_mask']  # [True, True, False, True]\n"
-           "    # Offline camera 2 has zeroed (black) frame");
+           "    # Offline camera 2 has zeroed (black) frame")
+      
+      .def("get_multi_frames", &FrameProvider::get_multi_frames,
+           py::arg("camera_id"), py::arg("num_frames"), py::arg("timeout_ms") = 10,
+           "Get multiple consecutive frames from a single camera's CPU ring buffer.\n\n"
+           "Pops up to num_frames frames in FIFO order (oldest first). Frames are consumed\n"
+           "from the buffer — subsequent calls return new frames.\n\n"
+           "Args:\n"
+           "    camera_id (int): Camera index (0 to stream_count-1).\n"
+           "    num_frames (int): Maximum number of frames to retrieve.\n"
+           "    timeout_ms (int): Max wait time for first frame in ms (default: 10).\n\n"
+           "Returns:\n"
+           "    dict: Batch data with keys:\n"
+           "        - data (numpy.ndarray): Contiguous array shape (N, H, W, C) or (N, H*1.5, W)\n"
+           "        - valid_mask (numpy.ndarray[bool]): Per-frame validity\n"
+           "        - metadata (list[dict]): Per-frame camera_id, frame_id, timestamp_ns\n"
+           "        - count (int): Actual number of frames returned (<= num_frames)\n"
+           "        - valid_count (int): Number of valid frames\n"
+           "        - width, height (int): Frame dimensions\n"
+           "        - format (str): Pixel format\n\n"
+           "Example:\n"
+           "    result = provider.get_multi_frames(camera_id=0, num_frames=8)\n"
+           "    frames = result['data']  # shape: (8, H, W, 3) for BGR\n"
+           "    for meta in result['metadata']:\n"
+           "        print(f\"Frame {meta['frame_id']} at {meta['timestamp_ns']}\")")
+
+      // -------------------------------------------------------------------
+      // WebRTC streaming control
+      // -------------------------------------------------------------------
+      .def("start_streaming", &FrameProvider::start_streaming,
+           py::arg("camera_id"),
+           "Start WebRTC streaming for a specific camera.\n\n"
+           "Safe to call at any time after start(). If the GStreamer pipeline\n"
+           "is not yet ready, streaming will auto-start when the pipeline comes up.\n\n"
+           "Args:\n"
+           "    camera_id (int): Camera index (0 to stream_count-1).\n\n"
+           "Returns:\n"
+           "    bool: True on success or already-queued, False on error.")
+
+      .def("stop_streaming", &FrameProvider::stop_streaming,
+           py::arg("camera_id"),
+           "Stop WebRTC streaming for a specific camera.\n\n"
+           "Safely detaches the WebRTC branch from the live pipeline.\n"
+           "The main decode pipeline continues uninterrupted.\n\n"
+           "Args:\n"
+           "    camera_id (int): Camera index (0 to stream_count-1).")
+
+      .def("start_streaming_all", &FrameProvider::start_streaming_all,
+           "Start WebRTC streaming for ALL cameras simultaneously.")
+
+      .def("stop_streaming_all", &FrameProvider::stop_streaming_all,
+           "Stop WebRTC streaming for ALL cameras simultaneously.")
+
+      .def("is_webrtc_streaming", &FrameProvider::is_webrtc_streaming,
+           py::arg("camera_id"),
+           "Check if WebRTC streaming is currently active for a camera.\n\n"
+           "Args:\n"
+           "    camera_id (int): Camera index (0 to stream_count-1).\n\n"
+           "Returns:\n"
+           "    bool: True if the WebRTC branch is live.");
 }
-
-

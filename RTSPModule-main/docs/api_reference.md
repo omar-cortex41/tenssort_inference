@@ -260,6 +260,46 @@ for i in range(batch['count']):
 
 ---
 
+#### `get_multi_frames(camera_id: int, num_frames: int, timeout_ms: int = 10) -> dict`
+
+Get multiple consecutive frames from a single camera's CPU ring buffer.
+
+**Requirements:**
+- `cpu_buffer_enabled` must be `true` in config
+
+**Parameters:**
+- `camera_id` (**int**): Camera index
+- `num_frames` (**int**): Maximum number of frames to retrieve
+- `timeout_ms` (**int**, optional): Max wait time for *first* frame (default: 10ms)
+
+**Returns:**
+- **dict**: Batch data covering multiple time steps (see [Batch Dictionary](#batch-dictionary))
+
+**Behavior:**
+- Pops up to `num_frames` from the ring buffer in FIFO order (oldest first)
+- Frames are **consumed** (removed from buffer)
+- Returns contiguous memory block `(N, H, W, C)`
+- If buffer has fewer frames than requested, returns what is available
+
+**Example:**
+```python
+# Get 8 frames from Camera 0
+result = provider.get_multi_frames(camera_id=0, num_frames=8)
+
+if result['count'] > 0:
+    # Shape: (8, H, W, 3) for BGR
+    frames = result['data']
+    
+    # Process temporal batch
+    print(f"Retrieved {result['count']} frames")
+```
+
+**Performance:**
+- Zero-copy from ring buffer to batch array (single memcpy per frame)
+- Ideal for sliding window inference (e.g., action recognition)
+
+---
+
 ### Statistics & Monitoring
 
 #### `get_stats(camera_id: int) -> dict`
@@ -311,6 +351,112 @@ print(f"Buffer: {info['buffer_count']}/{info['buffer_capacity']} frames")
 print(f"Duration: {info['buffer_duration_sec']:.1f}s")
 print(f"Memory: {info['memory_usage_mb']:.1f} MB")
 ```
+
+---
+
+### WebRTC Streaming
+
+#### `start_streaming(camera_id: int) -> bool`
+
+Start WebRTC streaming for a specific camera. Safe to call at any time after `start()`. If the GStreamer pipeline is not yet ready, streaming will auto-start when the pipeline comes up.
+
+**Parameters:**
+- `camera_id` (**int**): Camera index (0 to stream_count-1).
+
+**Returns:**
+- **bool**: `True` on success or already-queued, `False` on error.
+
+**Example:**
+```python
+success = provider.start_streaming(0)
+```
+
+---
+
+#### `stop_streaming(camera_id: int) -> None`
+
+Stop WebRTC streaming for a specific camera. Safely detaches the WebRTC branch from the live pipeline. The main decode pipeline continues uninterrupted.
+
+**Parameters:**
+- `camera_id` (**int**): Camera index (0 to stream_count-1).
+
+---
+
+#### `start_streaming_all() -> None`
+
+Start WebRTC streaming for ALL cameras simultaneously.
+
+---
+
+#### `stop_streaming_all() -> None`
+
+Stop WebRTC streaming for ALL cameras simultaneously.
+
+---
+
+#### `is_webrtc_streaming(camera_id: int) -> bool`
+
+Check if WebRTC streaming is currently active for a camera.
+
+**Parameters:**
+- `camera_id` (**int**): Camera index (0 to stream_count-1).
+
+**Returns:**
+- **bool**: `True` if the WebRTC branch is live.
+
+---
+
+### WebRTC Signaling API (HTTP)
+
+When WebRTC is enabled, a single Rust-powered HTTP signaling server is started (default port `9000`). All `webrtcrs_sink` elements share this single server. The architecture uses `stream_id` to route SDP exchange to the correct GStreamer pipeline.
+
+The `stream_id` corresponds to the numeric camera index from the Python API (e.g., `"0"`, `"1"`), unless overridden.
+
+#### `GET /health`
+Check if the signaling server is running.
+- **Returns:** HTTP 200 OK if successful.
+
+#### `GET /streams`
+List all currently active WebRTC streams registered with the server.
+- **Returns JSON:**
+  ```json
+  [
+    { "stream_id": "0" },
+    { "stream_id": "1" }
+  ]
+  ```
+
+#### `POST /webrtc/offer?stream_id={id}`
+Send a WebRTC SDP offer from a browser/client to the `webrtcrs_sink`.
+- **Query Parameters:** 
+  - `stream_id` (string): The stream identifier (e.g., `"0"` for camera 0)
+- **Request JSON:**
+  ```json
+  {
+    "sdp": "v=0\r\no=- 46... (WebRTC offer SDP)",
+    "type": "offer"
+  }
+  ```
+- **Returns JSON:**
+  ```json
+  {
+    "sdp": "v=0\r\no=- 52... (WebRTC answer SDP)",
+    "type": "answer",
+    "peer_id": "a1b2c3d4..."
+  }
+  ```
+*Note: Save the `peer_id` if you wish to gracefully disconnect later without tearing down the browser connection.*
+
+#### `POST /webrtc/disconnect`
+Gracefully close a specific peer's connection.
+- **Request JSON:**
+  ```json
+  {
+    "peer_id": "a1b2c3d4...",
+    "stream_id": "0"
+  }
+  ```
+- **Returns:** HTTP 200 OK.
 
 ---
 
@@ -534,14 +680,27 @@ settings:
   # Decoder selection
   decoder_preference: auto         # auto, nvv4l2, nvdec, cpu
   
+  # WebRTC streaming
+  webrtc_enabled: true             # Auto-start WebRTC streaming
+  webrtc_base_port: 9000           # Base port for signaling server
+  
   # Logging
   log_base_path: ./logs            # Base directory for logs
 
 streams:
+  # RTSP streams
   - name: "Front Camera"
     url: rtsp://user:pass@192.168.1.10:554/stream
   - name: "Rear Camera"
     url: rtsp://user:pass@192.168.1.11:554/stream
+  
+  # MP4 files with FPS-capped decoding
+  - name: "Demo Video"
+    file: /path/to/demo.mp4
+    loop: true
+    fps: 25
+  - name: "Test Clip"
+    file: /path/to/test.mp4
 ```
 
 ### Settings Reference
@@ -556,7 +715,25 @@ streams:
 | `cpu_buffer_duration_sec` | float | 2.0 | Seconds of video history to keep |
 | `output_format` | str | "NV12" | Output pixel format |
 | `decoder_preference` | str | "auto" | Decoder priority mode |
+| `webrtc_enabled` | bool | false | Auto-start WebRTC streaming |
+| `webrtc_base_port` | int | 9000 | Base port for WebRTC signaling server |
 | `log_base_path` | str | "./logs" | Directory for log files |
+
+### Stream Configuration Reference
+
+Each stream entry in the `streams` array can contain the following fields:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | str | Yes | Human-readable stream identifier (used for logging) |
+| `url` | str | Yes¹ | RTSP URL for live streams |
+| `file` | str | Yes¹ | Path to MP4 file for file-based streams |
+| `loop` | bool | No | Loop the file when it reaches the end (MP4 only, default: false) |
+| `fps` | int | No | Target FPS for frame rate capping (MP4 only, overrides file FPS) |
+
+**Notes:**
+- **Either** `url` **or** `file` must be specified, but not both
+- `loop` and `fps` parameters are only applicable to MP4 file sources
 
 ### Decoder Preference Modes
 

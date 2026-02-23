@@ -57,6 +57,34 @@ CpuFrame CpuBuffer::get(int timeout_ms) {
   return result;
 }
 
+std::vector<CpuFrame> CpuBuffer::getMulti(int count, int timeout_ms) {
+  std::vector<CpuFrame> results;
+  if (count <= 0) return results;
+  
+  results.reserve(static_cast<size_t>(count));
+  
+  std::unique_lock<std::mutex> lock(mutex_);
+  
+  // Wait for at least 1 frame if empty and timeout requested
+  if (count_ == 0 && timeout_ms > 0) {
+    cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                 [this] { return count_ > 0; });
+  }
+  
+  // Pop up to 'count' frames from head (FIFO: oldest first)
+  const size_t to_pop = std::min(static_cast<size_t>(count), count_);
+  for (size_t i = 0; i < to_pop; ++i) {
+    if (buffer_[head_] && buffer_[head_]->valid) {
+      results.push_back(std::move(*buffer_[head_]));
+      results.back().valid = true;
+    }
+    head_ = (head_ + 1) % capacity_;
+    --count_;
+  }
+  
+  return results;
+}
+
 void CpuBuffer::clear() {
   std::lock_guard<std::mutex> lock(mutex_);
   

@@ -25,10 +25,12 @@ Designed for **high-throughput video analytics**, RTSPModule leverages the **NVI
 | Feature | Description |
 |:---|:---|
 | **⚡ Zero-Copy GPU** | **DMA-BUF** (DeepStream) and **CUDA** (Standard) paths keep frames in VRAM for direct `torch`/`cupy` access. |
+| **🌐 WebRTC Native** | **Zero-latency** native browser streaming via internal Rust signaling server. View multiple cameras live without Python frame copying. |
 | **🛡️ 3-Tier Fallback** | Auto-selects **DeepStream (NVMM)** → **Standard CUDA** → **CPU** based on available hardware/drivers. |
 | **🏎️ Copy Pool** | Multi-threaded parallel memory pool for `get_batch()`, reducing latency for large batch sizes (e.g., 16+ streams). |
 | **🧠 Log Sniffer** | Intercepts low-level GStreamer errors (e.g., `cuInit failed`) to trigger **Global Fallback** to CPU mode, preventing crashes. |
 | **🔄 CPU Ring Buffer** | **Wait-free** ring buffer with **Auto-Resize** capabilities maintains temporal history and ensures high availability. |
+| **🎬 MP4 Support** | **Mixed-source streaming** with **FPS-capped decoding** for precise frame rate control on MP4 files. |
 | **🧵 True Concurrency** | GIL-released C++ threads + **Shared CUDA Context** (~250MB/stream saved) ensures zero-blocking high scalability. |
 
 ---
@@ -66,6 +68,7 @@ Requires CMake 3.18+, GStreamer 1.20+, and CUDA Toolkit.
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build . --target _core -j$(nproc)
+cd ..
 pip install .
 ```
 
@@ -103,6 +106,25 @@ Tests the frame synchronization mechanism across multiple streams.
 python3 tools/minimal_client/frame_sync.py
 ```
 
+#### 4. Web Viewer (WebSocket) (`05_web_viewer.py`)
+
+High-performance WebSocket dashboard for viewing all streams live at native FPS.
+
+```bash
+python3 examples/05_web_viewer.py
+```
+Open your browser at **http://localhost:8080** to view the Web dashboard.
+
+#### 5. WebRTC Viewer (`06_webrtc_viewer.py`)
+
+Native browser WebRTC dashboard with zero-latency streaming directly from the C++ pipeline.
+
+```bash
+python3 examples/06_webrtc_viewer.py
+```
+
+Open your browser at **http://localhost:8090** to view the WebRTC dashboard.
+
 See [docs/docker.md](docs/docker.md) for advanced configuration.
 
 ---
@@ -110,28 +132,49 @@ See [docs/docker.md](docs/docker.md) for advanced configuration.
 ## ⚡ Quick Start
 
 ```python
-import rtspmodule
+import sys
+import os
 import time
+import rtspmodule
 
-# Initialize with config
-provider = rtspmodule.RTSPModule()
-provider.start("config.yaml")
+def main():
+    print("=== Minimal RTSP Batch Test ===")
+    
+    rtsp = rtspmodule.RTSPModule()    
+    rtsp.start("configs/config.conf")
+    
+    # Check if CPU buffer is enabled
+    if not rtsp.is_cpu_buffer_enabled():
+        print("Note: Batch works best with 'cpu_buffer_enabled: true'")
+        
+    time.sleep(2)
+    
+    num_streams = rtsp.stream_count()
+    if num_streams == 0:
+        print("No active streams found.")
+        rtsp.stop()
+        return
+        
+    print(f"Batch processing {num_streams} streams...")
+    camera_ids = list(range(num_streams))
+    
+    try:
+        start_time = time.time()
+        for i in range(50):
+            batch = rtsp.get_batch(camera_ids, timeout_ms=10)
+            if batch['data'] is not None:
+                print(f"Batch {i}: {batch['valid_count']}/{batch['count']} valid. Shape: {batch['data'].shape}")
+            time.sleep(0.01)
+            
+        print(f"FPS: {50 / (time.time() - start_time):.1f}")
+        
+    except KeyboardInterrupt:
+        pass
+    finally:
+        rtsp.stop()
 
-# Wait for connections
-time.sleep(2)
-
-# Retrieve batch for inference (Zero-copy GPU pointers)
-# Returns: { camera_id: { 'ptr': int, 'shape': tuple, ... } }
-batch = provider.get_batch(
-    stream_ids=[0, 1, 2],
-    timeout_ms=33
-)
-
-for cam_id, meta in batch.items():
-    if meta['valid']:
-        print(f"Cam {cam_id}: Received frame {meta['frame_id']} on GPU")
-
-provider.stop()
+if __name__ == "__main__":
+    main()
 ```
 
 
@@ -146,6 +189,7 @@ RTSPModule/
 │   ├── core/               # Core C++ implementation
 │   └── rtspmodule/         # Compiled module output
 ├── examples/               # Example Python scripts / C++
+├── scripts/                # Utility scripts (build, setup)
 ├── docs/                   # Detailed documentation
 ├── include/                # C++ headers
 ├── tests/                  # Integration and Unit tests

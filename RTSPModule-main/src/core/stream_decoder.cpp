@@ -1,16 +1,21 @@
 #include <rtspmodule/stream_decoder.h>
+#include <rtspmodule/webrtc_sink_bin.hpp>
+#include <rtspmodule/stream_pipeline_builder.hpp>
+#include <rtspmodule/buffer_mapper.hpp>
+
 #define GST_USE_UNSTABLE_API
 #include <cuda_runtime.h>
 #include <gst/rtsp/gstrtsp.h>
 #include <gst/sdp/gstsdpmessage.h>
 #include <iostream>
 
-// Conditional GStreamer CUDA memory support (for standard NVDEC path)
+using namespace rtsp;
+
+// Conditional GStreamer CUDA memory support
 #ifdef HAVE_GST_CUDA
 #include <gst/cuda/gstcuda.h>
 #endif
 
-// Conditional DeepStream NVMM support - requires DMA-BUF for buffer access
 #ifdef HAVE_DEEPSTREAM
 #include <nvbufsurface.h>
 #include <gst/allocators/gstdmabuf.h>
@@ -61,13 +66,20 @@ static void gst_gpu_error_sniffer(GstDebugCategory *category,
 
 StreamDecoder::StreamDecoder(int id, const std::string &name,
                              const std::string &url, size_t max_queue_size,
-                             const std::string& output_format)
+                             const std::string& output_format,
+                             const std::string& decoder_preference,
+                             bool is_file_source,
+                             bool loop_file,
+                             double target_fps)
     : id_(id), name_(name), url_(url), frame_counter_(0), has_error_(false),
       pipeline_(nullptr), last_frame_time_(0), reconnect_count_(0),
       running_(false), max_queue_depth_(max_queue_size),
-      gpu_buffer_(), output_format_(output_format) {
+      gpu_buffer_(), output_format_(output_format),
+      decoder_preference_(decoder_preference), is_file_source_(is_file_source),
+      loop_file_(loop_file), target_fps_(target_fps) {
   std::cout << "[" << id_ << "] Queue depth: " << max_queue_depth_ 
-            << ", Output format: " << output_format_ << std::endl;
+            << ", Output format: " << output_format_
+            << ", Decoder preference: " << decoder_preference_ << std::endl;
 
   static std::once_flag log_handler_flag;
   std::call_once(log_handler_flag, [](){
@@ -127,208 +139,24 @@ GstBusSyncReply StreamDecoder::busSyncHandler(GstBus *bus, GstMessage *msg,
 }
 
 bool StreamDecoder::create() {
-  std::string id_str =
-      std::to_string(id_) + "_" + std::to_string(reconnect_count_);
-
-  // Sync with global failure flag from log sniffer
-  if (global_gpu_failure_.load()) {
-      hardware_accel_failed_ = true;
-  }
-
-  // Force CPU buffer mode if hardware acceleration failed
-  // This ensures frames are pushed to cpu_buffer_ instead of trying dead GPU copy
-  if (hardware_accel_failed_) {
-      cpu_buffer_enabled_ = true;
-      std::cout << "[" << id_ << "] Hardware failure detected/persisted - forcing CPU buffer mode" << std::endl;
-  }
-
-  // Determine source type: RTSP, file://, or direct file path
-  is_file_source_ = false;
-  std::string file_path;
-
-  if (url_.find("file://") == 0) {
-      is_file_source_ = true;
-      file_path = url_.substr(7);  // Remove "file://" prefix
-  } else if (url_.find("rtsp://") != 0 && url_.find("rtsps://") != 0) {
-      // Check if it's a direct file path (starts with / or contains common video extensions)
-      if (url_[0] == '/' || url_.find(".mp4") != std::string::npos ||
-          url_.find(".mkv") != std::string::npos || url_.find(".avi") != std::string::npos ||
-          url_.find(".mov") != std::string::npos || url_.find(".ts") != std::string::npos) {
-          is_file_source_ = true;
-          file_path = url_;
-      } else {
-          std::string err_msg = "Invalid URL scheme (must start with rtsp://, rtsps://, file://, or be a file path): " + url_;
-          std::cerr << "[" << id_ << "] [ERROR] " << err_msg << std::endl;
-          if (logger_) {
-              logger_->logError(rtsp::ErrorCategory::InvalidConfig, err_msg);
-          }
-          return false;
-      }
-  }
-
-  if (is_file_source_) {
-      std::cout << "[" << id_ << "] Opening file: " << file_path << std::endl;
-  } else {
-      std::cout << "[" << id_ << "] Connecting to RTSP URL: " << url_ << std::endl;
-  }
-
-  pipeline_ = gst_pipeline_new(("pipeline-" + id_str).c_str());
-  if (!pipeline_)
-    return false;
-
- 
-  GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline_));
-  gst_bus_set_sync_handler(bus, busSyncHandler, this, nullptr);
-  gst_object_unref(bus);
-
-  // Create source element based on URL type
-  if (is_file_source_) {
-    source_ = gst_element_factory_make("filesrc", ("src-" + id_str).c_str());
-    demux_ = gst_element_factory_make("qtdemux", ("demux-" + id_str).c_str());
-  } else {
-    source_ = gst_element_factory_make("rtspsrc", ("src-" + id_str).c_str());
-    demux_ = nullptr;
-  }
-
-  // 3-tier converter selection: nvvideoconvert (DeepStream) → cudaconvert (NVDEC) → videoconvert (CPU)
-  GstElement* convert = nullptr;
-  use_nvmm_memory_ = false;
-  use_cuda_memory_ = false;
-
-  if (!hardware_accel_failed_) {
-    // First, verify GPU is actually accessible via CUDA
-    int cuda_device_count = 0;
-    cudaError_t cuda_err = cudaGetDeviceCount(&cuda_device_count);
-    bool cuda_available = (cuda_err == cudaSuccess && cuda_device_count > 0);
-    
-    if (!cuda_available) {
-      hardware_accel_failed_ = true;
-      std::cout << "[" << id_ << "] CUDA not available (devices=" << cuda_device_count 
-                << ", err=" << cudaGetErrorString(cuda_err) << ") - forcing CPU decoder" << std::endl;
-      if (logger_) {
-        logger_->logError(rtsp::ErrorCategory::HardwareAccelFailed,
-                          "CUDA not available, forcing software decoder");
-      }
-    }
-  }
-
-  if (!hardware_accel_failed_) {
-    // Tier 1: Check if DeepStream's nvv4l2decoder is available
-    // nvv4l2decoder requires NVIDIA driver to be loaded (/dev/nvidia0)
-    GstElementFactory* nvv4l2_factory = gst_element_factory_find("nvv4l2decoder");
-    if (nvv4l2_factory) {
-      gst_object_unref(nvv4l2_factory);
-      
-      // Try NVMM hardware decoding (works in WSL with DeepStream)
-      convert = gst_element_factory_make("nvvideoconvert", ("convert-" + id_str).c_str());
-      if (convert) {
-        use_nvmm_memory_ = true;
-        std::cout << "[" << id_ << "] Using DeepStream NVMM path (nvvideoconvert)" << std::endl;
-        if (logger_) {
-          logger_->logInfo("Converter selected: nvvideoconvert (DeepStream NVMM)");
-        }
-      }
-    }
-  }
-
-  // Tier 2: NVDEC decode outputs NV12 directly - no color conversion needed
-  // The nvh264dec element outputs NV12 to CPU memory by default
-  // We just need a passthrough element (or skip converter entirely)
-  // For now, fall through to CPU videoconvert which handles NV12 passthrough
-
-  // Tier 3: CPU fallback
-  if (!convert) {
-    convert = gst_element_factory_make("videoconvert", ("convert-" + id_str).c_str());
-    std::cout << "[" << id_ << "] Using CPU videoconvert (hardware acceleration unavailable)" << std::endl;
-    if (logger_) {
-      logger_->logWarning("Hardware acceleration unavailable, using CPU videoconvert");
-      if (hardware_accel_failed_) {
-        logger_->logError(rtsp::ErrorCategory::HardwareAccelFailed,
-                          "GPU decode/convert failed, fell back to CPU");
-      }
-    }
-  }
-
-  appsink_ = gst_element_factory_make("appsink", ("sink-" + id_str).c_str());
-
-  // Validate required elements
-  if (!source_ || !convert || !appsink_) {
-    destroy();
-    return false;
-  }
-  if (is_file_source_ && !demux_) {
-    destroy();
+  StreamPipelineBuilder builder(this);
+  PipelineElements el;
+  
+  if (!builder.build(el)) {
     return false;
   }
 
-  convert_ = convert;
+  pipeline_ = el.pipeline;
+  source_ = el.source;
+  demuxer_ = el.demuxer;
+  decodebin_ = el.decodebin;
+  depay_ = el.depay;
+  parse_ = el.parse;
+  decoder_ = el.decoder;
+  convert_ = el.convert;
+  appsink_ = el.appsink;
+  webrtc_tee_ = el.webrtc_tee;
 
-  // Configure source element based on type
-  if (is_file_source_) {
-    g_object_set(source_, "location", file_path.c_str(), nullptr);
-  } else {
-    g_object_set(source_, "location", url_.c_str(), "latency", 500,
-                 "drop-on-latency", TRUE, "udp-buffer-size", 524288,
-                 "protocols", 7,
-                 nullptr);
-  }
-
-  // Request configured output format with appropriate memory type
-  GstCaps *caps;
-  std::string caps_str;
-  if (use_nvmm_memory_) {
-    // DeepStream NVMM memory path
-    caps_str = "video/x-raw(memory:NVMM), format=" + output_format_;
-  } else if (use_cuda_memory_) {
-    // Standard GStreamer CUDA memory path
-    caps_str = "video/x-raw(memory:CUDAMemory), format=" + output_format_;
-  } else {
-    // CPU memory path
-    caps_str = "video/x-raw, format=" + output_format_;
-  }
-  caps = gst_caps_from_string(caps_str.c_str());
-
-  g_object_set(appsink_, "emit-signals", TRUE, "drop", TRUE, "max-buffers", 2,
-               "caps", caps, "sync", FALSE, nullptr);
-  gst_caps_unref(caps);
-
-  g_signal_connect(appsink_, "new-sample", G_CALLBACK(onNewSample), this);
-
-  // Build pipeline based on source type
-  if (is_file_source_) {
-    // File pipeline: filesrc -> qtdemux -> (dynamic pad) -> parse -> decode -> convert -> appsink
-    gst_bin_add_many(GST_BIN(pipeline_), source_, demux_, convert, appsink_, nullptr);
-
-    if (!gst_element_link(source_, demux_)) {
-      std::cerr << "[" << id_ << "] Failed to link filesrc to demux" << std::endl;
-      destroy();
-      return false;
-    }
-
-    if (!gst_element_link(convert, appsink_)) {
-      destroy();
-      return false;
-    }
-
-    // Connect to demux pad-added signal for dynamic linking
-    g_signal_connect(demux_, "pad-added", G_CALLBACK(onDemuxPadAdded), this);
-  } else {
-    // RTSP pipeline: rtspsrc -> (dynamic pad) -> depay -> parse -> decode -> convert -> appsink
-    gst_bin_add_many(GST_BIN(pipeline_), source_, convert, appsink_, nullptr);
-
-    if (!gst_element_link(convert, appsink_)) {
-      destroy();
-      return false;
-    }
-
-    g_signal_connect(source_, "pad-added", G_CALLBACK(onPadAdded), this);
-  }
-
-  std::cout << "[" << id_ << "] Created pipeline: " << name_ << std::endl;
-  if (logger_) {
-    logger_->logStateChange(rtsp::CameraState::Connecting,
-                            "Pipeline created for " + url_);
-  }
   return true;
 }
 
@@ -375,6 +203,12 @@ void StreamDecoder::stop() {
   
   if (bus_thread_.joinable())
     bus_thread_.join();
+
+  // Cleanly detach the WebRTC branch before tearing down the pipeline.
+  // This sets elements to NULL, unlinks pads, and removes them from the bin
+  // — preventing GStreamer-CRITICAL "Trying to dispose element in PLAYING".
+  stop_streaming();
+
   destroy();
 }
 
@@ -386,14 +220,14 @@ void StreamDecoder::destroy() {
   }
 
   source_ = nullptr;
-  demux_ = nullptr;
+  demuxer_ = nullptr;
+  decodebin_ = nullptr;
   depay_ = nullptr;
   parse_ = nullptr;
   decoder_ = nullptr;
   convert_ = nullptr;
   appsink_ = nullptr;
   decoder_linked_ = false;
-  is_file_source_ = false;
   last_frame_time_ = 0;
 
   // Clean up frame queue
@@ -402,13 +236,10 @@ void StreamDecoder::destroy() {
     frame_queue_.pop();
   }
   
-  // Deallocate GPU buffer to prevent memory leak on reconnect
-  // This releases: CUDA device memory, pinned host memory, stream, and event
   gpu_buffer_.deallocate();
   cuda_device_ptr_ = 0;
   cpu_buffer_.reset();
   
-  // Reset FPS tracking - protected by stats_mutex_ since fps_timestamps_ns_ is shared
   {
     std::lock_guard<std::mutex> slock(stats_mutex_);
     fps_timestamps_ns_.clear();
@@ -417,6 +248,88 @@ void StreamDecoder::destroy() {
     stats_.current_fps = 0.0;
     stats_.instant_fps = 0.0;
   }
+  
+  webrtc_tee_ = nullptr;
+  webrtc_bin_ = nullptr;
+  webrtc_streaming_active_ = false;
+  webrtc_is_h265_ = false;
+}
+
+void StreamDecoder::setWebRtcConfig(int signaling_port, const std::string& stream_id) {
+  webrtc_signaling_port_ = signaling_port;
+  webrtc_stream_id_      = stream_id;
+}
+
+// WebRTC and Pipeline building logic moved to WebrtcSinkBin and StreamPipelineBuilder
+
+bool StreamDecoder::start_streaming() {
+  if (webrtc_streaming_active_.load()) {
+    return false;
+  }
+  if (!pipeline_ || !webrtc_tee_) {
+    webrtc_enabled_ = true;
+    return true;
+  }
+
+  std::string id_str = std::to_string(id_) + "_" + std::to_string(reconnect_count_.load());
+
+  webrtc_bin_ = create_webrtc_sink_bin(id_str, webrtc_signaling_port_, webrtc_stream_id_, 
+                                       use_cuda_memory_, use_nvmm_memory_, 
+                                       webrtc_is_h265_, webrtc_is_h265_);
+
+  if (!webrtc_bin_) {
+    std::cerr << "[" << id_ << "] WebRTC: failed to create sink bin" << std::endl;
+    return false;
+  }
+
+  gst_bin_add(GST_BIN(pipeline_), webrtc_bin_);
+  gst_element_sync_state_with_parent(webrtc_bin_);
+
+  GstPad* tee_src = gst_element_request_pad_simple(webrtc_tee_, "src_%u");
+  GstPad* bin_sink = gst_element_get_static_pad(webrtc_bin_, "sink");
+  GstPadLinkReturn link_ret = gst_pad_link(tee_src, bin_sink);
+  gst_object_unref(tee_src);
+  gst_object_unref(bin_sink);
+
+  if (link_ret != GST_PAD_LINK_OK) {
+    std::cerr << "[" << id_ << "] WebRTC: failed to link tee to bin" << std::endl;
+    gst_bin_remove(GST_BIN(pipeline_), webrtc_bin_);
+    webrtc_bin_ = nullptr;
+    return false;
+  }
+
+  webrtc_streaming_active_ = true;
+  std::cout << "[" << id_ << "] WebRTC streaming STARTED on port " << webrtc_signaling_port_
+            << " (stream-id: " << webrtc_stream_id_ << ")" << std::endl;
+  return true;
+}
+
+void StreamDecoder::stop_streaming() {
+  if (!webrtc_streaming_active_.load()) {
+    return;
+  }
+  if (!webrtc_tee_ || !webrtc_bin_) {
+    webrtc_streaming_active_ = false;
+    return;
+  }
+
+  gst_element_set_state(webrtc_bin_, GST_STATE_NULL);
+
+  GstPad* bin_sink = gst_element_get_static_pad(webrtc_bin_, "sink");
+  if (bin_sink) {
+    GstPad* tee_src = gst_pad_get_peer(bin_sink);
+    if (tee_src) {
+      gst_pad_unlink(tee_src, bin_sink);
+      gst_element_release_request_pad(webrtc_tee_, tee_src);
+      gst_object_unref(tee_src);
+    }
+    gst_object_unref(bin_sink);
+  }
+
+  gst_bin_remove(GST_BIN(pipeline_), webrtc_bin_);
+  webrtc_bin_ = nullptr;
+  webrtc_streaming_active_ = false;
+  std::cout << "[" << id_ << "] WebRTC streaming STOPPED" << std::endl;
 }
 
 bool StreamDecoder::recreate() {
@@ -507,12 +420,19 @@ void StreamDecoder::busLoop() {
         break;
       }
       case GST_MESSAGE_EOS:
-        std::cout << "[" << id_ << "] EOS" << std::endl;
-        if (logger_) {
-          logger_->logStateChange(rtsp::CameraState::StreamLost,
-                                  "End of stream received");
+        if (is_file_source_ && loop_file_) {
+          std::cout << "[" << id_ << "] EOS received, seeking to beginning for loop" << std::endl;
+          // Seek to beginning to loop the file
+          gst_element_seek_simple(pipeline_, GST_FORMAT_TIME, 
+                                 static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT), 0);
+        } else {
+          std::cout << "[" << id_ << "] EOS received" << std::endl;
+          if (logger_) {
+            logger_->logStateChange(rtsp::CameraState::StreamLost,
+                                    "End of stream received");
+          }
+          markError();
         }
-        markError();
         break;
 
       case GST_MESSAGE_WARNING: {
@@ -569,110 +489,51 @@ void StreamDecoder::busLoop() {
 }
 
 GpuFrameInfo StreamDecoder::getGpuFrame(int timeout_ms) {
-  std::unique_lock<std::mutex> lock(frame_mutex_);
-  
-  // Wait if queue is empty and timeout is requested
-  if (frame_queue_.empty() && timeout_ms > 0 && running_) {
-    queue_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), 
-                       [this] { return !frame_queue_.empty() || !running_; });
-  }
-
-  GpuFrameInfo info;
-  info.valid = false;
-
-  // Pop from queue instead of reading single buffer
-  if (!frame_queue_.empty()) {
-    QueuedFrame &qf = frame_queue_.front();
-
-    // Map the sample to get GPU pointer
-    GstBuffer *buffer = gst_sample_get_buffer(qf.sample);
-    if (buffer) {
-      // NVMM memory path (DeepStream) - extract pointer from NvBufSurface
-      if (use_nvmm_memory_) {
-#ifdef HAVE_DEEPSTREAM
-        // DeepStream NVMM: Access NvBufSurface via DMA-BUF file descriptor
-        // This is the correct approach for DeepStream 7.x+
-        GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
-        if (mem && gst_is_dmabuf_memory(mem)) {
-          int dmabuf_fd = gst_dmabuf_memory_get_fd(mem);
-          NvBufSurface *surf = nullptr;
-          
-          if (NvBufSurfaceFromFd(dmabuf_fd, (void **)&surf) == 0 && surf) {
-            if (surf->numFilled > 0 && surf->surfaceList[0].dataPtr) {
-              info.ptr = (uint64_t)surf->surfaceList[0].dataPtr;
-              info.width = surf->surfaceList[0].width;
-              info.height = surf->surfaceList[0].height;
-              info.stride = surf->surfaceList[0].pitch;
-              info.size = surf->surfaceList[0].dataSize;
-              info.frame_id = qf.frame_id;
-              info.format = output_format_;
-              info.valid = true;
-              
-              cuda_device_ptr_ = info.ptr;
-              current_stride_ = info.stride;
+    QueuedFrame q_frame = {nullptr, 0, 0, 0, 0, 0, 0, 0};
+    {
+        std::unique_lock<std::mutex> lock(frame_mutex_);
+        if (frame_queue_.empty()) {
+            if (timeout_ms <= 0) return {0, 0, 0, 0, 0, 0, "", false};
+            if (queue_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms)) == std::cv_status::timeout) {
+                return {0, 0, 0, 0, 0, 0, "", false};
             }
-          }
         }
-#else
-        // Non-DeepStream build: NVMM path selected but no NvBufSurface support
-        // This is a configuration error - NVMM requires DeepStream SDK
-        static std::once_flag warn_flag;
-        std::call_once(warn_flag, [this]() {
-          std::cerr << "[" << id_ << "] WARNING: NVMM path selected but HAVE_DEEPSTREAM not defined" << std::endl;
-        });
-#endif
-      }
-      // CUDA memory path (requires HAVE_GST_CUDA headers)
-#ifdef HAVE_GST_CUDA
-      else if (use_cuda_memory_) {
-        GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
-        if (mem && gst_is_cuda_memory(mem)) {
-          GstMapInfo map;
-          if (gst_memory_map(mem, &map,
-                             (GstMapFlags)(GST_MAP_READ | GST_MAP_CUDA))) {
-            info.ptr = reinterpret_cast<uint64_t>(map.data);
-            info.width = qf.width;
-            info.height = qf.height;
-            info.stride = qf.stride;
-            info.size = qf.data_size;
-            info.frame_id = qf.frame_id;
-            info.format = output_format_;
-            info.valid = true;
-
-            // Store stride for internal use
-            cuda_device_ptr_ = info.ptr;
-            current_stride_ = qf.stride;
-
-            gst_memory_unmap(mem, &map);
-          }
-        }
-      }
-#endif
-      if (!info.valid && gpu_buffer_.isReady()) {
-        // Fallback path (CPU copy to GPU)
-        info.ptr = gpu_buffer_.devicePtrAsInt();
-        info.width = gpu_buffer_.width();
-        info.height = gpu_buffer_.height();
-        info.stride = gpu_buffer_.width();
-        info.size = gpu_buffer_.dataSize();
-        info.frame_id = qf.frame_id;
-        info.format = output_format_;
-        info.valid = true;
-      }
+        if (frame_queue_.empty()) return {0, 0, 0, 0, 0, 0, "", false};
+        q_frame = frame_queue_.front();
+        frame_queue_.pop();
     }
 
-    if (info.valid) {
-      // Release the sample and remove from queue
-      gst_sample_unref(qf.sample);
-      frame_queue_.pop();
+    GpuFrameInfo info;
+    info.width = q_frame.width;
+    info.height = q_frame.height;
+    info.stride = q_frame.stride;
+    info.size = q_frame.data_size;
+    info.frame_id = q_frame.frame_id;
+    info.valid = true;
+    info.format = output_format_;
 
-      std::lock_guard<std::mutex> slock(stats_mutex_);
-      stats_.frames_consumed++;
-      stats_.queue_depth = frame_queue_.size();
+    GstBuffer* buffer = gst_sample_get_buffer(q_frame.sample);
+    uint64_t ptr = 0;
+    int stride = 0;
+
+    if (BufferMapper::mapGpuBuffer(buffer, use_nvmm_memory_, use_cuda_memory_, 
+                                  info.width, info.height, &q_frame.stride, 
+                                  ptr, stride)) {
+        info.ptr = ptr;
+        info.stride = stride;
+    } else {
+        info.ptr = 0;
     }
-  }
 
-  return info;
+    gst_sample_unref(q_frame.sample);
+    
+    {
+        std::lock_guard<std::mutex> slock(stats_mutex_);
+        stats_.frames_consumed++;
+        stats_.queue_depth = frame_queue_.size();
+    }
+
+    return info;
 }
 
 FrameStats StreamDecoder::getStats() const {
@@ -681,228 +542,153 @@ FrameStats StreamDecoder::getStats() const {
 }
 
 GstFlowReturn StreamDecoder::onNewSample(GstElement *sink, gpointer data) {
-  auto self = static_cast<StreamDecoder *>(data);
+    auto self = static_cast<StreamDecoder *>(data);
+    GstSample *sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
+    if (!sample) return GST_FLOW_OK; // Changed from GST_FLOW_ERROR to GST_FLOW_OK to match original behavior on no sample
 
-  GstSample *sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
-  if (!sample)
-    return GST_FLOW_OK;
-
-  // Track that we received a frame from GStreamer
-  {
-    std::lock_guard<std::mutex> slock(self->stats_mutex_);
-    self->stats_.frames_received++;
-  }
-  
-  // Update watchdog timestamp
-  self->last_frame_rx_time_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
-    std::chrono::steady_clock::now().time_since_epoch()).count();
-
-  // Check if this is first frame after initial connection or reconnection
-  if (self->pending_first_frame_) {
-    self->pending_first_frame_ = false;
-    std::cout << "[" << self->id_ << "] Connected (first frame received)" << std::endl;
-    if (self->logger_) {
-      self->logger_->logStateChange(rtsp::CameraState::Connected,
-                                    "First frame received - connection confirmed");
+    // Track that we received a frame from GStreamer
+    {
+        std::lock_guard<std::mutex> slock(self->stats_mutex_);
+        self->stats_.frames_received++;
     }
-  } else if (self->pending_reconnect_) {
-    self->pending_reconnect_ = false;
-    std::cout << "[" << self->id_ << "] Recovered (first frame received)" << std::endl;
-    if (self->logger_) {
-      self->logger_->logStateChange(rtsp::CameraState::Reconnected,
-                                    "Successfully recovered - first frame received");
+
+    // Update watchdog timestamp
+    self->last_frame_rx_time_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    // Check if this is first frame after initial connection or reconnection
+    if (self->pending_first_frame_) {
+        self->pending_first_frame_ = false;
+        std::cout << "[" << self->id_ << "] Connected (first frame received)" << std::endl;
+        if (self->logger_) {
+            self->logger_->logStateChange(rtsp::CameraState::Connected,
+                                          "First frame received - connection confirmed");
+        }
+    } else if (self->pending_reconnect_) {
+        self->pending_reconnect_ = false;
+        std::cout << "[" << self->id_ << "] Recovered (first frame received)" << std::endl;
+        if (self->logger_) {
+            self->logger_->logStateChange(rtsp::CameraState::Reconnected,
+                                          "Successfully recovered - first frame received");
+        }
     }
-  }
 
-  GstBuffer *buffer = gst_sample_get_buffer(sample);
-  GstCaps *caps = gst_sample_get_caps(sample);
-  GstVideoInfo info;
-  
-  // Guard: caps can be NULL during pipeline negotiation
-  if (!caps) {
-    gst_sample_unref(sample);
-    return GST_FLOW_OK;
-  }
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    GstCaps *caps = gst_sample_get_caps(sample);
+    GstVideoInfo v_info;
+    
+    // Guard: caps can be NULL during pipeline negotiation
+    if (!caps || !gst_video_info_from_caps(&v_info, caps)) {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
 
-  // Check for duplicate frame using PTS (presentation timestamp)
-  uint64_t pts = GST_BUFFER_PTS(buffer);
-  if (pts != GST_CLOCK_TIME_NONE && pts == self->last_pts_ && self->last_pts_ != 0) {
-    // Duplicate frame detected - skip it
-    std::lock_guard<std::mutex> slock(self->stats_mutex_);
-    self->stats_.frames_duplicate++;
-    gst_sample_unref(sample);
-    return GST_FLOW_OK;
-  }
-  self->last_pts_ = pts;
+    // Check for duplicate frame using PTS (presentation timestamp)
+    uint64_t pts = GST_BUFFER_PTS(buffer);
+    if (pts != GST_CLOCK_TIME_NONE && pts == self->last_pts_ && self->last_pts_ != 0) {
+        // Duplicate frame detected - skip it
+        std::lock_guard<std::mutex> slock(self->stats_mutex_);
+        self->stats_.frames_duplicate++;
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+    self->last_pts_ = pts;
 
-  if (gst_video_info_from_caps(&info, caps)) {
-    int w = GST_VIDEO_INFO_WIDTH(&info);
-    int h = GST_VIDEO_INFO_HEIGHT(&info);
-    size_t frame_size = (size_t)(w * h * 1.5); // NV12
+    uint64_t frame_id = ++self->frame_counter_;
+    self->updateFrameTime();
+    self->updateFps();
 
-    std::lock_guard<std::mutex> lock(self->frame_mutex_);
     bool success = false;
+    uint64_t cuda_ptr = 0;
+    int current_stride = 0;
 
-    // NVMM memory path (DeepStream) - extract pointer from NvBufSurface via DMA-BUF
-    if (self->use_nvmm_memory_) {
-#ifdef HAVE_DEEPSTREAM
-      // DeepStream NVMM: Access NvBufSurface via DMA-BUF file descriptor
-      // This is the correct approach for DeepStream 7.x+
-      GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
-      if (mem && gst_is_dmabuf_memory(mem)) {
-        int dmabuf_fd = gst_dmabuf_memory_get_fd(mem);
-        NvBufSurface *surf = nullptr;
-        
-        if (NvBufSurfaceFromFd(dmabuf_fd, (void **)&surf) == 0 && surf) {
-          if (surf->numFilled > 0 && surf->surfaceList[0].dataPtr) {
-            self->cuda_device_ptr_ = (uint64_t)surf->surfaceList[0].dataPtr;
-            self->current_stride_ = surf->surfaceList[0].pitch;
-            success = true;
-          }
-        }
-      }
-#else
-      // Non-DeepStream build: NVMM path selected but no NvBufSurface support
-      // This is a configuration error - log warning once and fall through to CPU
-      static std::once_flag warn_flag;
-      std::call_once(warn_flag, [self]() {
-        std::cerr << "[" << self->id_ << "] WARNING: NVMM path selected but HAVE_DEEPSTREAM not defined" << std::endl;
-      });
-#endif
-    }
-
-    // CUDA memory path (requires HAVE_GST_CUDA headers)
-#ifdef HAVE_GST_CUDA
-    if (!success && self->use_cuda_memory_) {
-      GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
-      if (mem && gst_is_cuda_memory(mem)) {
-        GstCudaMemory *cuda_mem = GST_CUDA_MEMORY_CAST(mem);
+    if (self->cpu_buffer_enabled_ && self->cpu_buffer_) {
+        // CPU buffer mode: copy frame to ring buffer (preferred when enabled)
+        // This must be checked FIRST because Python reads from CPU buffer via get_batch().
+        // With NVMM, mapGpuBuffer() would succeed and put frames in GPU queue,
+        // but Python's get_batch() reads from CPU buffer — causing starvation.
+        BufferMapper::pushToCpuBuffer(self->cpu_buffer_.get(), buffer,
+                                      self->output_format_, v_info.width, v_info.height,
+                                      v_info.stride[0], frame_id);
+        success = true;
+    } else if (BufferMapper::mapGpuBuffer(buffer, self->use_nvmm_memory_, self->use_cuda_memory_,
+                                   v_info.width, v_info.height, &v_info.stride[0],
+                                   cuda_ptr, current_stride)) {
+        success = true;
+    } else {
+        // Fallback: CPU memory path with copy to GPU (for GPU queue mode only)
         GstMapInfo map;
-        if (gst_memory_map(mem, &map,
-                           (GstMapFlags)(GST_MAP_READ | GST_MAP_CUDA))) {
-          self->cuda_device_ptr_ = reinterpret_cast<uint64_t>(map.data);
-          int inferred_stride = (int)(map.size / (h * 1.5));
+        if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+            size_t required_size = (size_t)(v_info.width * v_info.height * 1.5); // NV12
 
-          if (inferred_stride > info.stride[0] &&
-              (map.size % (int)(h * 1.5) == 0)) {
-            self->current_stride_ = inferred_stride;
-          } else {
-            self->current_stride_ = info.stride[0];
-          }
+            // Dynamically allocate or reallocate GPU buffer as needed
+            if (!self->gpu_buffer_.isAllocated() ||
+                self->gpu_buffer_.size() < required_size) {
+                self->gpu_buffer_.allocate(required_size);
+            }
 
-          success = true;
-          gst_memory_unmap(mem, &map);
+            if (self->gpu_buffer_.isAllocated() &&
+                self->gpu_buffer_.copyToDevice(map.data, map.size, v_info.width, v_info.height)) {
+                cuda_ptr = 0; // Use gpu_buffer_ path
+                current_stride = v_info.width;  // Fallback is packed
+                success = true;
+            }
+            gst_buffer_unmap(buffer, &map);
         }
-      }
-    }
-#endif
-
-    // CPU buffer mode: Direct path without GPU buffer (for when GPU is unavailable)
-    if (!success && self->cpu_buffer_enabled_ && self->cpu_buffer_) {
-      // CPU buffer mode doesn't need gpu_buffer_, just mark success
-      // The actual data copy happens in pushToCpuBuffer()
-      self->current_stride_ = w;  // Packed stride
-      success = true;
-    }
-
-    // Fallback: CPU memory path with copy to GPU (for GPU queue mode only)
-    if (!success && !self->cpu_buffer_enabled_) {
-      GstMapInfo map;
-      if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-        size_t required_size = (size_t)(w * h * 1.5); // NV12
-
-        // Dynamically allocate or reallocate GPU buffer as needed
-        if (!self->gpu_buffer_.isAllocated() ||
-            self->gpu_buffer_.size() < required_size) {
-          self->gpu_buffer_.allocate(required_size);
-        }
-
-        if (self->gpu_buffer_.isAllocated() &&
-            self->gpu_buffer_.copyToDevice(map.data, map.size, w, h)) {
-          self->cuda_device_ptr_ = 0; // Use gpu_buffer_ path
-          self->current_stride_ = w;  // Fallback is packed
-          success = true;
-        }
-        gst_buffer_unmap(buffer, &map);
-      }
     }
 
     if (!success) {
         static std::atomic<int> log_counter{0};
         int count = log_counter.fetch_add(1);
         if (count < 50) {
-             std::cout << "[" << self->id_ << "] Processing FAIL. CUDA=" << self->use_cuda_memory_ 
-                       << ", CPU_En=" << self->cpu_buffer_enabled_ 
+             std::cout << "[" << self->id_ << "] Processing FAIL. CUDA=" << self->use_cuda_memory_
+                       << ", CPU_En=" << self->cpu_buffer_enabled_
                        << ", Buf=" << (self->cpu_buffer_ ? "YES" : "NULL") << std::endl;
         }
-    }
-
-    if (success) {
-      // CPU buffer mode OR GPU queue mode (mutually exclusive)
-      if (self->cpu_buffer_enabled_ && self->cpu_buffer_) {
-        // ...
-
-        // CPU buffer mode: copy frame to ring buffer
-        {
-          std::lock_guard<std::mutex> slock(self->stats_mutex_);
-          self->stats_.frames_decoded++;
-        }
-        self->pushToCpuBuffer(buffer, w, h, ++self->frame_counter_);
-        self->updateFps();
-        self->updateFrameTime();
+        std::lock_guard<std::mutex> slock(self->stats_mutex_);
+        self->stats_.frames_dropped_decode++;
+        self->stats_.decode_errors++;
         gst_sample_unref(sample);
         return GST_FLOW_OK;
-      } else {
-        // GPU queue mode: queue-based buffering for zero overwrites
-        // Original pattern: stats_mutex_ protects both stats AND frame_queue_
-        {
-          std::lock_guard<std::mutex> slock(self->stats_mutex_);
-          self->stats_.frames_decoded++;
+    }
 
-          // If queue is full, drop oldest frame to make room
-          if (self->frame_queue_.size() >= self->max_queue_depth_) {
+    // GPU queue mode: queue-based buffering for zero overwrites
+    // Original pattern: stats_mutex_ protects both stats AND frame_queue_
+    {
+        std::lock_guard<std::mutex> slock(self->stats_mutex_);
+        self->stats_.frames_decoded++;
+
+        // If queue is full, drop oldest frame to make room
+        if (self->frame_queue_.size() >= self->max_queue_depth_) {
             QueuedFrame &oldest = self->frame_queue_.front();
             gst_sample_unref(oldest.sample);
             self->frame_queue_.pop();
             self->stats_.frames_dropped_queue++;
-          }
-
-          // Create queued frame entry
-          QueuedFrame qf;
-          qf.sample = sample; // Transfer ownership to queue
-          qf.frame_id = ++self->frame_counter_;
-          qf.width = w;
-          qf.height = h;
-          qf.stride = self->current_stride_;
-          qf.data_size = frame_size;
-          qf.cuda_ptr = self->cuda_device_ptr_;
-          qf.timestamp_ns = GST_BUFFER_PTS(buffer);
-
-          self->frame_queue_.push(qf);
-          self->queue_cv_.notify_one(); 
-
-          // Update stats
-          size_t depth = self->frame_queue_.size();
-          self->stats_.queue_depth = depth;
-          if (depth > self->stats_.queue_max_depth) {
-            self->stats_.queue_max_depth = depth;
-          }
         }
 
-        self->updateFps();
-        self->updateFrameTime();
-        return GST_FLOW_OK;
-      }
-    } else {
-      // Track decode/mapping failure
-      std::lock_guard<std::mutex> slock(self->stats_mutex_);
-      self->stats_.frames_dropped_decode++;
-      self->stats_.decode_errors++;
-    }
-  }
+        // Create queued frame entry
+        QueuedFrame qf;
+        qf.sample = sample; // Transfer ownership to queue
+        qf.frame_id = frame_id;
+        qf.width = v_info.width;
+        qf.height = v_info.height;
+        qf.stride = current_stride;
+        qf.data_size = gst_buffer_get_size(buffer); // Use actual buffer size
+        qf.cuda_ptr = cuda_ptr;
+        qf.timestamp_ns = GST_BUFFER_PTS(buffer);
 
-  gst_sample_unref(sample);
-  return GST_FLOW_OK;
+        self->frame_queue_.push(qf);
+        self->queue_cv_.notify_one();
+
+        // Update stats
+        size_t depth = self->frame_queue_.size();
+        self->stats_.queue_depth = depth;
+        if (depth > self->stats_.queue_max_depth) {
+            self->stats_.queue_max_depth = depth;
+        }
+    }
+
+    return GST_FLOW_OK;
 }
 
 void StreamDecoder::updateFps() {
@@ -1014,7 +800,6 @@ GstPadProbeReturn StreamDecoder::onParserCaps(GstPad *pad,
               is_startup = false;
               
               std::ostringstream oss;
-              oss << "Stream format changed: ";
               bool added = false;
               
               if (width != old_w || height != old_h) {
@@ -1085,358 +870,7 @@ GstPadProbeReturn StreamDecoder::onParserCaps(GstPad *pad,
   return GST_PAD_PROBE_OK;
 }
 
-void StreamDecoder::onPadAdded(GstElement *element, GstPad *pad,
-                               gpointer data) {
-  auto self = static_cast<StreamDecoder *>(data);
-  
-  // Sync with global failure flag
-  if (global_gpu_failure_.load()) {
-      self->hardware_accel_failed_ = true;
-  }
-
-  if (self->decoder_linked_)
-    return;
-
-  GstCaps *caps = gst_pad_get_current_caps(pad);
-  if (!caps)
-    caps = gst_pad_query_caps(pad, nullptr);
-
-  GstStructure *str = gst_caps_get_structure(caps, 0);
-  const gchar *name = gst_structure_get_name(str);
-
-  if (g_str_has_prefix(name, "application/x-rtp")) {
-    const gchar *media = gst_structure_get_string(str, "media");
-    if (media && g_strcmp0(media, "video") == 0) {
-
-      const gchar *encoding = gst_structure_get_string(str, "encoding-name");
-      std::string id_str = std::to_string(self->id_) + "_" +
-                           std::to_string(self->reconnect_count_);
-      bool is_h265 = false;
-
-      if (encoding) {
-        std::string enc(encoding);
-        is_h265 = (enc == "H265" || enc == "HEVC");
-        std::cout << "[" << self->id_ << "] Codec: " << encoding << " ("
-                  << (is_h265 ? "H265" : "H264") << ")" << std::endl;
-      }
-
-      if (is_h265) {
-        self->depay_ = gst_element_factory_make("rtph265depay",
-                                                ("depay-" + id_str).c_str());
-        self->parse_ =
-            gst_element_factory_make("h265parse", ("parse-" + id_str).c_str());
-        
-        // Add probe to parser src pad to get FPS
-        if (self->parse_) {
-            GstPad *src_pad = gst_element_get_static_pad(self->parse_, "src");
-            if (src_pad) {
-                gst_pad_add_probe(src_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
-                                  onParserCaps, self, nullptr);
-                gst_object_unref(src_pad);
-            }
-        }
-
-        // 3-tier decoder selection: nvv4l2decoder → nvh265dec → avdec_h265
-        self->decoder_ = nullptr;
-        
-        // Tier 1: DeepStream nvv4l2decoder (if NVMM path active)
-        if (self->use_nvmm_memory_ && !self->hardware_accel_failed_) {
-          self->decoder_ = gst_element_factory_make("nvv4l2decoder", ("decode-" + id_str).c_str());
-          if (self->decoder_) {
-            self->active_decoder_type_ = DecoderType::NVV4L2_NVMM;
-            std::cout << "[" << self->id_ << "] Using nvv4l2decoder (DeepStream NVMM) for H265" << std::endl;
-            if (self->logger_) {
-              self->logger_->logInfo("Decoder selected: NVV4L2_NVMM (DeepStream) for H265");
-            }
-          }
-        }
-        
-        // Tier 2: Standard NVDEC
-        if (!self->decoder_ && !self->hardware_accel_failed_) {
-          self->decoder_ = gst_element_factory_make("nvh265dec", ("decode-" + id_str).c_str());
-          if (self->decoder_) {
-            g_object_set(self->decoder_, "num-output-surfaces", 1, nullptr);
-            self->active_decoder_type_ = DecoderType::NVDEC_CUDA;
-            std::cout << "[" << self->id_ << "] Using nvh265dec (NVDEC CUDA) for H265" << std::endl;
-            if (self->logger_) {
-              self->logger_->logInfo("Decoder selected: NVDEC_CUDA for H265");
-            }
-          }
-        }
-        
-        // Tier 3: CPU fallback
-        if (!self->decoder_) {
-          self->decoder_ = gst_element_factory_make("avdec_h265", ("decode-" + id_str).c_str());
-          self->active_decoder_type_ = DecoderType::AVDEC_CPU;
-          std::cout << "[" << self->id_ << "] Using avdec_h265 (CPU) for H265" << std::endl;
-          if (self->logger_) {
-            self->logger_->logWarning("Hardware acceleration unavailable, falling back to AVDEC_CPU for H265");
-            if (self->hardware_accel_failed_) {
-              self->logger_->logError(rtsp::ErrorCategory::HardwareAccelFailed,
-                                      "GPU decoder failed, using CPU decoder for H265");
-            }
-          }
-        }
-      } else {
-        self->depay_ = gst_element_factory_make("rtph264depay",
-                                                ("depay-" + id_str).c_str());
-        self->parse_ =
-            gst_element_factory_make("h264parse", ("parse-" + id_str).c_str());
-        
-        // Add probe to parser src pad to get FPS
-        if (self->parse_) {
-            GstPad *src_pad = gst_element_get_static_pad(self->parse_, "src");
-            if (src_pad) {
-                gst_pad_add_probe(src_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
-                                  onParserCaps, self, nullptr);
-                gst_object_unref(src_pad);
-            }
-        }
-
-        // 3-tier decoder selection: nvv4l2decoder → nvh264dec → avdec_h264
-        self->decoder_ = nullptr;
-        
-        // Tier 1: DeepStream nvv4l2decoder (if NVMM path active)
-        if (self->use_nvmm_memory_ && !self->hardware_accel_failed_) {
-          self->decoder_ = gst_element_factory_make("nvv4l2decoder", ("decode-" + id_str).c_str());
-          if (self->decoder_) {
-            self->active_decoder_type_ = DecoderType::NVV4L2_NVMM;
-            std::cout << "[" << self->id_ << "] Using nvv4l2decoder (DeepStream NVMM) for H264" << std::endl;
-            if (self->logger_) {
-              self->logger_->logInfo("Decoder selected: NVV4L2_NVMM (DeepStream) for H264");
-            }
-          }
-        }
-        
-        // Tier 2: Standard NVDEC
-        if (!self->decoder_ && !self->hardware_accel_failed_) {
-          self->decoder_ = gst_element_factory_make("nvh264dec", ("decode-" + id_str).c_str());
-          if (self->decoder_) {
-            g_object_set(self->decoder_, "num-output-surfaces", 1, nullptr);
-            self->active_decoder_type_ = DecoderType::NVDEC_CUDA;
-            std::cout << "[" << self->id_ << "] Using nvh264dec (NVDEC CUDA) for H264" << std::endl;
-            if (self->logger_) {
-              self->logger_->logInfo("Decoder selected: NVDEC_CUDA for H264");
-            }
-          }
-        }
-        
-        // Tier 3: CPU fallback
-        if (!self->decoder_) {
-          self->decoder_ = gst_element_factory_make("avdec_h264", ("decode-" + id_str).c_str());
-          self->active_decoder_type_ = DecoderType::AVDEC_CPU;
-          std::cout << "[" << self->id_ << "] Using avdec_h264 (CPU) for H264" << std::endl;
-          if (self->logger_) {
-            self->logger_->logWarning("Hardware acceleration unavailable, falling back to AVDEC_CPU for H264");
-            if (self->hardware_accel_failed_) {
-              self->logger_->logError(rtsp::ErrorCategory::HardwareAccelFailed,
-                                      "GPU decoder failed, using CPU decoder for H264");
-            }
-          }
-        }
-      }
-
-      if (self->depay_ && self->parse_ && self->decoder_) {
-        g_object_set(self->parse_, "config-interval", -1, nullptr);
-        gst_bin_add_many(GST_BIN(self->pipeline_), self->depay_, self->parse_,
-                         self->decoder_, nullptr);
-
-        if (gst_element_link_many(self->depay_, self->parse_, self->decoder_,
-                                  self->convert_, nullptr)) {
-          gst_element_sync_state_with_parent(self->depay_);
-          gst_element_sync_state_with_parent(self->parse_);
-          gst_element_sync_state_with_parent(self->decoder_);
-
-          GstPad *sink = gst_element_get_static_pad(self->depay_, "sink");
-          if (sink) {
-            gst_pad_link(pad, sink);
-            gst_object_unref(sink);
-          }
-          self->decoder_linked_ = true;
-        } else {
-          // Linking failed - remove elements from bin and unref to prevent leak
-          gst_bin_remove_many(GST_BIN(self->pipeline_), self->depay_,
-                              self->parse_, self->decoder_, nullptr);
-          // MUST unref after removing from bin (bin doesn't own the ref after remove)
-          gst_object_unref(self->depay_);
-          gst_object_unref(self->parse_);
-          gst_object_unref(self->decoder_);
-          self->depay_ = nullptr;
-          self->parse_ = nullptr;
-          self->decoder_ = nullptr;
-        }
-      } else {
-        // Partial creation - clean up any successfully created elements
-        if (self->depay_) {
-          gst_object_unref(self->depay_);
-          self->depay_ = nullptr;
-        }
-        if (self->parse_) {
-          gst_object_unref(self->parse_);
-          self->parse_ = nullptr;
-        }
-        if (self->decoder_) {
-          gst_object_unref(self->decoder_);
-          self->decoder_ = nullptr;
-        }
-      }
-    }
-  }
-  gst_caps_unref(caps);
-}
-
-// Callback for file source demuxer (qtdemux) pad-added
-void StreamDecoder::onDemuxPadAdded(GstElement *element, GstPad *pad,
-                                    gpointer data) {
-  auto self = static_cast<StreamDecoder *>(data);
-
-  // Sync with global failure flag
-  if (global_gpu_failure_.load()) {
-      self->hardware_accel_failed_ = true;
-  }
-
-  if (self->decoder_linked_)
-    return;
-
-  GstCaps *caps = gst_pad_get_current_caps(pad);
-  if (!caps)
-    caps = gst_pad_query_caps(pad, nullptr);
-
-  GstStructure *str = gst_caps_get_structure(caps, 0);
-  const gchar *name = gst_structure_get_name(str);
-
-  // Check for video stream (video/x-h264, video/x-h265, video/mpeg, etc.)
-  if (g_str_has_prefix(name, "video/")) {
-    std::string id_str = std::to_string(self->id_) + "_" +
-                         std::to_string(self->reconnect_count_);
-    bool is_h265 = (g_strcmp0(name, "video/x-h265") == 0);
-    bool is_h264 = (g_strcmp0(name, "video/x-h264") == 0);
-
-    std::cout << "[" << self->id_ << "] File codec: " << name << std::endl;
-
-    if (is_h265) {
-      self->parse_ = gst_element_factory_make("h265parse", ("parse-" + id_str).c_str());
-
-      // Add probe to parser src pad to get FPS
-      if (self->parse_) {
-          GstPad *src_pad = gst_element_get_static_pad(self->parse_, "src");
-          if (src_pad) {
-              gst_pad_add_probe(src_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
-                                onParserCaps, self, nullptr);
-              gst_object_unref(src_pad);
-          }
-      }
-
-      // 3-tier decoder selection for H265
-      self->decoder_ = nullptr;
-
-      if (self->use_nvmm_memory_ && !self->hardware_accel_failed_) {
-        self->decoder_ = gst_element_factory_make("nvv4l2decoder", ("decode-" + id_str).c_str());
-        if (self->decoder_) {
-          self->active_decoder_type_ = DecoderType::NVV4L2_NVMM;
-          std::cout << "[" << self->id_ << "] Using nvv4l2decoder (DeepStream NVMM) for H265" << std::endl;
-        }
-      }
-
-      if (!self->decoder_ && !self->hardware_accel_failed_) {
-        self->decoder_ = gst_element_factory_make("nvh265dec", ("decode-" + id_str).c_str());
-        if (self->decoder_) {
-          g_object_set(self->decoder_, "num-output-surfaces", 1, nullptr);
-          self->active_decoder_type_ = DecoderType::NVDEC_CUDA;
-          std::cout << "[" << self->id_ << "] Using nvh265dec (NVDEC CUDA) for H265" << std::endl;
-        }
-      }
-
-      if (!self->decoder_) {
-        self->decoder_ = gst_element_factory_make("avdec_h265", ("decode-" + id_str).c_str());
-        self->active_decoder_type_ = DecoderType::AVDEC_CPU;
-        std::cout << "[" << self->id_ << "] Using avdec_h265 (CPU) for H265" << std::endl;
-      }
-    } else if (is_h264) {
-      self->parse_ = gst_element_factory_make("h264parse", ("parse-" + id_str).c_str());
-
-      // Add probe to parser src pad to get FPS
-      if (self->parse_) {
-          GstPad *src_pad = gst_element_get_static_pad(self->parse_, "src");
-          if (src_pad) {
-              gst_pad_add_probe(src_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
-                                onParserCaps, self, nullptr);
-              gst_object_unref(src_pad);
-          }
-      }
-
-      // 3-tier decoder selection for H264
-      self->decoder_ = nullptr;
-
-      if (self->use_nvmm_memory_ && !self->hardware_accel_failed_) {
-        self->decoder_ = gst_element_factory_make("nvv4l2decoder", ("decode-" + id_str).c_str());
-        if (self->decoder_) {
-          self->active_decoder_type_ = DecoderType::NVV4L2_NVMM;
-          std::cout << "[" << self->id_ << "] Using nvv4l2decoder (DeepStream NVMM) for H264" << std::endl;
-        }
-      }
-
-      if (!self->decoder_ && !self->hardware_accel_failed_) {
-        self->decoder_ = gst_element_factory_make("nvh264dec", ("decode-" + id_str).c_str());
-        if (self->decoder_) {
-          g_object_set(self->decoder_, "num-output-surfaces", 1, nullptr);
-          self->active_decoder_type_ = DecoderType::NVDEC_CUDA;
-          std::cout << "[" << self->id_ << "] Using nvh264dec (NVDEC CUDA) for H264" << std::endl;
-        }
-      }
-
-      if (!self->decoder_) {
-        self->decoder_ = gst_element_factory_make("avdec_h264", ("decode-" + id_str).c_str());
-        self->active_decoder_type_ = DecoderType::AVDEC_CPU;
-        std::cout << "[" << self->id_ << "] Using avdec_h264 (CPU) for H264" << std::endl;
-      }
-    } else {
-      // Unsupported codec - try decodebin as fallback
-      std::cout << "[" << self->id_ << "] Unsupported codec: " << name << ", skipping" << std::endl;
-      gst_caps_unref(caps);
-      return;
-    }
-
-    // Link: demux -> parse -> decoder -> [cudaupload ->] convert
-    if (self->parse_ && self->decoder_) {
-      g_object_set(self->parse_, "config-interval", -1, nullptr);
-      gst_bin_add_many(GST_BIN(self->pipeline_), self->parse_, self->decoder_, nullptr);
-
-      if (gst_element_link_many(self->parse_, self->decoder_, self->convert_, nullptr)) {
-        gst_element_sync_state_with_parent(self->parse_);
-        gst_element_sync_state_with_parent(self->decoder_);
-
-        GstPad *sink = gst_element_get_static_pad(self->parse_, "sink");
-        if (sink) {
-          GstPadLinkReturn ret = gst_pad_link(pad, sink);
-          if (ret != GST_PAD_LINK_OK) {
-            std::cerr << "[" << self->id_ << "] Failed to link demux to parse: " << ret << std::endl;
-          }
-          gst_object_unref(sink);
-        }
-        self->decoder_linked_ = true;
-        std::cout << "[" << self->id_ << "] File decoder pipeline linked successfully" << std::endl;
-      } else {
-        std::cerr << "[" << self->id_ << "] Failed to link parse -> decoder -> convert" << std::endl;
-        gst_bin_remove_many(GST_BIN(self->pipeline_), self->parse_, self->decoder_, nullptr);
-        gst_object_unref(self->parse_);
-        gst_object_unref(self->decoder_);
-        self->parse_ = nullptr;
-        self->decoder_ = nullptr;
-      }
-    } else {
-      if (self->parse_) {
-        gst_object_unref(self->parse_);
-        self->parse_ = nullptr;
-      }
-      if (self->decoder_) {
-        gst_object_unref(self->decoder_);
-        self->decoder_ = nullptr;
-      }
-    }
-  }
-  gst_caps_unref(caps);
-}
+// onPadAdded logic moved to StreamPipelineBuilder
 
 // CPU Buffer Methods
 
@@ -1510,104 +944,6 @@ void StreamDecoder::enableCpuBufferFallback() {
   setCpuBufferConfig(true, cpu_buffer_duration_sec_, 25.0);
 }
 
-void StreamDecoder::pushToCpuBuffer(GstBuffer* buffer, int width, int height, uint64_t frame_id) {
-  // PRE: Caller (onNewSample) must hold frame_mutex_
-  // DO NOT acquire frame_mutex_ here - it would cause deadlock (std::mutex is non-recursive)
-  if (!cpu_buffer_) return;
-  
-  GstMapInfo map;
-  if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-    return;
-  }
-  
-  CpuFrame frame;
-  frame.width = width;
-  frame.height = height;
-  frame.frame_id = frame_id;
-  frame.timestamp_ns = GST_BUFFER_PTS(buffer);
-  frame.capture_time_ns = std::chrono::steady_clock::now().time_since_epoch().count();
-  frame.format = output_format_;
-  frame.valid = true;
-  
-  // Calculate expected packed size and actual stride
-  size_t expected_size = 0;
-  int bytes_per_pixel = 0;
-  
-  if (output_format_ == "NV12" || output_format_ == "I420") {
-    expected_size = static_cast<size_t>(width * height * 1.5);
-    bytes_per_pixel = 1;  // For Y plane
-  } else if (output_format_ == "RGB" || output_format_ == "BGR") {
-    expected_size = static_cast<size_t>(width * height * 3);
-    bytes_per_pixel = 3;
-  } else if (output_format_ == "RGBA" || output_format_ == "BGRA") {
-    expected_size = static_cast<size_t>(width * height * 4);
-    bytes_per_pixel = 4;
-  } else {
-    // Unknown format - copy as-is
-    expected_size = map.size;
-    bytes_per_pixel = 0;
-  }
-  
-  // Check if we have stride padding
-  bool has_stride_padding = (map.size > expected_size);
-  
-  if (!has_stride_padding || bytes_per_pixel == 0) {
-    // No stride padding or unknown format - direct copy
-    frame.data.assign(map.data, map.data + std::min(map.size, expected_size));
-  } else if (output_format_ == "NV12") {
-    // NV12: Y plane (height rows) + UV plane (height/2 rows)
-    // Stride is likely current_stride_ member
-    int stride = current_stride_;
-    if (stride == 0) stride = width;  // Fallback
-    
-    // Allocate packed buffer
-    frame.data.resize(expected_size);
-    uint8_t* dst = frame.data.data();
-    const uint8_t* src = map.data;
-    
-    // Copy Y plane row by row
-    for (int y = 0; y < height; y++) {
-      std::memcpy(dst, src + y * stride, width);
-      dst += width;
-    }
-    
-    // Copy UV plane row by row (interleaved UV, height/2 rows)
-    const uint8_t* uv_src = map.data + stride * height;
-    for (int y = 0; y < height / 2; y++) {
-      std::memcpy(dst, uv_src + y * stride, width);
-      dst += width;
-    }
-  } else {
-    // RGB/BGR/RGBA/BGRA: copy row by row
-    int stride = static_cast<int>(map.size / height);  // Estimate stride
-    int row_bytes = width * bytes_per_pixel;
-    
-    frame.data.resize(expected_size);
-    uint8_t* dst = frame.data.data();
-    const uint8_t* src = map.data;
-    
-    for (int y = 0; y < height; y++) {
-      std::memcpy(dst, src + y * stride, row_bytes);
-      dst += row_bytes;
-    }
-  }
-  
-  frame.data_size = frame.data.size();
-  
-  gst_buffer_unmap(buffer, &map);
-  
-  cpu_buffer_->push(std::move(frame));
-  
-  // Update queue stats for CPU buffer
-  {
-    std::lock_guard<std::mutex> slock(stats_mutex_);
-    stats_.queue_depth = cpu_buffer_->size();
-    if (stats_.queue_depth > stats_.queue_max_depth) {
-      stats_.queue_max_depth = stats_.queue_depth;
-    }
-  }
-}
-
 CpuFrame StreamDecoder::getCpuFrame(int timeout_ms) {
   // Acquire frame_mutex_ to prevent race with setCpuBufferConfig() resetting cpu_buffer_
   std::unique_lock<std::mutex> lock(frame_mutex_);
@@ -1624,6 +960,22 @@ CpuFrame StreamDecoder::getCpuFrame(int timeout_ms) {
     stats_.frames_consumed++;
   }
   return frame;
+}
+
+std::vector<CpuFrame> StreamDecoder::getCpuFrames(int count, int timeout_ms) {
+  std::unique_lock<std::mutex> lock(frame_mutex_);
+  if (!cpu_buffer_) {
+    return {};
+  }
+  CpuBuffer* buf = cpu_buffer_.get();
+  lock.unlock();
+  
+  auto frames = buf->getMulti(count, timeout_ms);
+  if (!frames.empty()) {
+    std::lock_guard<std::mutex> slock(stats_mutex_);
+    stats_.frames_consumed += frames.size();
+  }
+  return frames;
 }
 
 CpuBufferInfo StreamDecoder::getCpuBufferInfo() const {
@@ -1649,6 +1001,7 @@ const CpuFrame* StreamDecoder::peekLatestFrame(int timeout_ms) const {
   return cpu_buffer_->peekLatest(timeout_ms);
 }
 
+// getBytesPerPixel logic moved to BufferMapper
 double StreamDecoder::getBytesPerPixel(const std::string& format) {
   if (format == "NV12" || format == "I420") return 1.5;
   if (format == "RGB" || format == "BGR") return 3.0;

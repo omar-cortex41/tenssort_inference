@@ -31,3 +31,4 @@ dist/
 # Runtime (Generated)
 output/
 logs/
+gst-webrtcrs/.cargo_home/gst-webrtcrs/target/

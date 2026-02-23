@@ -56,7 +56,7 @@ void print_stats(const RtspClient& client, int camera_id) {
               << " | Resolution: " << stats.source_width << "x" << stats.source_height
               << "\n";
 }
-
+ 
 // -----------------------------------------------------------------------------
 // Example 1: Single-frame retrieval (CPU buffer mode)
 // -----------------------------------------------------------------------------

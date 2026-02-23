@@ -1,0 +1,131 @@
+# Build stage
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    git \
+    python3-dev \
+    python3-pip \
+    cmake \
+    pkg-config \
+    wget \
+    libglib2.0-dev \
+    libssl-dev \
+    libyaml-cpp-dev \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install scikit-build-core pybind11 build
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /building
+
+# Download DeepStream 7.1 Debian package
+RUN wget --content-disposition 'https://api.ngc.nvidia.com/v2/resources/org/nvidia/deepstream/7.1/files?redirect=true&path=deepstream-7.1_7.1.0-1_amd64.deb' -O deepstream-7.1_7.1.0-1_amd64.deb
+
+# Install DeepStream SDK (and its dependencies)
+# Note: This will install GStreamer and other deps listed in the deb control file
+RUN apt-get update && \
+    apt-get install -y ./deepstream-7.1_7.1.0-1_amd64.deb && \
+    rm -rf /var/lib/apt/lists/*
+
+# Run additional install script required by DeepStream
+#RUN cd /opt/nvidia/deepstream/deepstream && ./user_additional_install.sh
+
+WORKDIR /working/app
+COPY . .
+
+# Step 1: Build the native module with cmake
+# DeepStream libs are in /opt/nvidia/deepstream/deepstream/lib
+# We need to ensure CMake finds them if they aren't in standard paths
+RUN rm -rf build && mkdir build && cd build && \
+    cmake .. && \
+    make -j$(nproc)
+
+# Step 2: Build wheel
+# Step 2: Build wheels for multiple Python versions (3.9-3.12)
+RUN chmod +x scripts/build_wheels_conda.sh && ./scripts/build_wheels_conda.sh
+
+
+# Final Stage
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+# Install runtime dependencies
+# libnpp-12-4 is MISSING in pytorch runtime image but required by DeepStream
+# We need to add NVIDIA repo to install it
+RUN apt-get update && apt-get install -y wget && \
+    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && \
+    apt-get update && apt-get install -y \
+    python3-pip \
+    libyaml-cpp-dev \
+    libglib2.0-0 \
+    libssl3 \
+    libgstrtspserver-1.0-0 \
+    libjansson4 \
+    libjsoncpp25 \
+    libnpp-12-4 \
+    && rm -rf /var/lib/apt/lists/* && \
+    rm cuda-keyring_1.1-1_all.deb
+
+WORKDIR /tmp_install
+
+# Copy DeepStream deb from builder to avoid re-downloading
+COPY --from=builder /building/deepstream-7.1_7.1.0-1_amd64.deb .
+
+# Install DeepStream SDK
+RUN apt-get update && \
+    apt-get install -y ./deepstream-7.1_7.1.0-1_amd64.deb && \
+    rm -rf /var/lib/apt/lists/* && \
+    rm deepstream-7.1_7.1.0-1_amd64.deb
+
+# Run additional install script
+#RUN cd /opt/nvidia/deepstream/deepstream && ./user_additional_install.sh
+
+# Copy built wheels
+COPY --from=builder /working/app/wheels /wheels
+COPY --from=builder /working/app/lib /workspace/lib
+
+WORKDIR /workspace
+
+# Install rtspmodule from wheel + python runtime dependencies
+RUN PY_VER=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')") && \
+    WHEEL=$(ls /wheels/rtspmodule-*-${PY_VER}-*.whl 2>/dev/null | head -1) && \
+    if [ -z "$WHEEL" ]; then echo "ERROR: No wheel found for Python $PY_VER"; exit 1; fi && \
+    pip3 install --no-cache-dir "$WHEEL" \
+    cupy-cuda12x \
+    opencv-python \
+    pyyaml \
+    psutil \
+    pynvml \
+    aiohttp \
+    simplejpeg \
+    nvidia-nvjpeg-cu12 \
+    && rm -rf /wheels
+
+# Configure dynamic linker for NVIDIA libraries installed via pip
+RUN find /opt/conda/lib/python3.11/site-packages/nvidia -name "lib" -type d > /etc/ld.so.conf.d/nvidia-python.conf && \
+    ldconfig
+
+# Set environment variables for DeepStream
+ENV CUDA_HOME=/usr/local/cuda
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/nvidia/deepstream/deepstream/lib:$LD_LIBRARY_PATH
+ENV GST_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/gstreamer-1.0:/opt/nvidia/deepstream/deepstream/lib/gst-plugins:/workspace/lib
+
+CMD ["/bin/bash"]
+
+# Export Stage
+# This stage is used to extract the built artifacts to the local filesystem
+# Usage: DOCKER_BUILDKIT=1 docker build --target export --output type=local,dest=./wheel/deepstream . -f docker/Dockerfile.pytorch_deepstream
+FROM scratch AS export
+COPY --from=builder /working/app/wheels/*.whl /
+COPY --from=builder /working/app/lib /lib

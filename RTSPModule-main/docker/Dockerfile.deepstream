@@ -9,8 +9,12 @@ RUN apt-get update && apt-get install -y \
     cmake \
     python3-pip \
     libyaml-cpp-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install scikit-build-core pybind11 build
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Run DeepStream additional install script for software decoder support
 RUN cd /opt/nvidia/deepstream/deepstream && ./user_additional_install.sh
@@ -51,6 +55,7 @@ RUN cd /opt/nvidia/deepstream/deepstream && ./user_additional_install.sh
 
 # Copy built wheel
 COPY --from=builder /working/wheels /wheels
+COPY --from=builder /working/app/lib /workspace/lib
 
 WORKDIR /workspace
 
@@ -67,5 +72,6 @@ RUN pip3 install --no-cache-dir /wheels/*.whl \
 
 # DeepStream images might not set this by default for our workspace
 ENV PYTHONPATH=/workspace:$PYTHONPATH
+ENV GST_PLUGIN_PATH=/opt/nvidia/deepstream/deepstream/lib/gst-plugins:/workspace/lib
 
 CMD ["/bin/bash"]

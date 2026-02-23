@@ -65,6 +65,22 @@ bool RtspClient::loadConfig(const std::string &config_file) {
         output_format_ = settings["output_format"].as<std::string>();
         std::cout << "Config: output_format = " << output_format_ << std::endl;
       }
+      
+      // Decoder preference
+      if (settings["decoder_preference"]) {
+        decoder_preference_ = settings["decoder_preference"].as<std::string>();
+        std::cout << "Config: decoder_preference = " << decoder_preference_ << std::endl;
+      }
+
+      // WebRTC settings
+      if (settings["webrtc_enabled"]) {
+        webrtc_autostart_ = settings["webrtc_enabled"].as<bool>();
+        std::cout << "Config: webrtc_enabled = " << (webrtc_autostart_ ? "true" : "false") << std::endl;
+      }
+      if (settings["webrtc_base_port"]) {
+        webrtc_base_port_ = settings["webrtc_base_port"].as<int>();
+        std::cout << "Config: webrtc_base_port = " << webrtc_base_port_ << std::endl;
+      }
     }
 
     if (!config["streams"])
@@ -72,14 +88,58 @@ bool RtspClient::loadConfig(const std::string &config_file) {
 
     int id = 0;
     for (const auto &stream : config["streams"]) {
-      if (!stream.IsMap() || !stream["url"])
+      if (!stream.IsMap())
         continue;
 
-      std::string url = stream["url"].as<std::string>();
-      std::string name = stream["name"] ? stream["name"].as<std::string>()
-                                        : "Camera " + std::to_string(id + 1);
+      // Validate that either url or file is present, but not both
+      bool has_url = stream["url"].IsDefined();
+      bool has_file = stream["file"].IsDefined();
+      
+      if (!has_url && !has_file) {
+        std::cerr << "Stream entry missing both 'url' and 'file' keys, skipping" << std::endl;
+        continue;
+      }
+      
+      if (has_url && has_file) {
+        std::cerr << "Stream entry has both 'url' and 'file' keys, only one allowed, skipping" << std::endl;
+        continue;
+      }
+
+      std::string url;
+      std::string name;
+      bool is_file_source = false;
+      bool loop_file = false;
+      double target_fps = 0.0; // Default: native FPS
+      
+      if (has_url) {
+        url = stream["url"].as<std::string>();
+        name = stream["name"] ? stream["name"].as<std::string>()
+                              : "Camera " + std::to_string(id + 1);
+      } else {
+        url = stream["file"].as<std::string>();
+        is_file_source = true;
+        name = stream["name"] ? stream["name"].as<std::string>()
+                              : "File " + std::to_string(id + 1);
+        
+        // Check for loop parameter (only applies to file sources)
+        if (stream["loop"]) {
+          loop_file = stream["loop"].as<bool>();
+        }
+        
+        // Check for fps parameter (only applies to file sources)
+        if (stream["fps"]) {
+          target_fps = stream["fps"].as<double>();
+        }
+      }
+      
+      // Allow per-stream overrides of decoder preference
+      std::string stream_pref = decoder_preference_;
+      if (stream["decoder_preference"]) {
+          stream_pref = stream["decoder_preference"].as<std::string>();
+      }
+
       decoders_.push_back(
-          std::make_unique<StreamDecoder>(id++, name, url, buffer_size_, output_format_));
+          std::make_unique<StreamDecoder>(id++, name, url, buffer_size_, output_format_, stream_pref, is_file_source, loop_file, target_fps));
     }
   } catch (...) {
     return false;
@@ -197,6 +257,10 @@ bool RtspClient::start() {
     if (cpu_buffer_enabled_) {
       d->setCpuBufferConfig(true, cpu_buffer_duration_sec_, 25.0);  // Default 25fps, will adjust with detected FPS
     }
+    // Configure WebRTC — all streams share one signaling port, identified by stream_id
+    std::string stream_id = d->getName();
+    std::replace(stream_id.begin(), stream_id.end(), ' ', '-');
+    d->setWebRtcConfig(webrtc_base_port_, stream_id);
     d->start();
     
     // After starting, check if decoder is actually using GPU pipeline
@@ -204,6 +268,12 @@ bool RtspClient::start() {
     if (!cpu_buffer_enabled_ && !d->isUsingGpuPipeline()) {
       std::cout << "[" << d->getId() << "] GPU pipeline incomplete - enabling CPU buffer fallback" << std::endl;
       d->enableCpuBufferFallback();
+    }
+    
+    // If webrtc_autostart_, defer start_streaming until onPadAdded via webrtc_enabled_ flag
+    // (The pipeline may not be ready yet, start_streaming() handles this automatically)
+    if (webrtc_autostart_) {
+      d->start_streaming();  // Sets webrtc_enabled_=true if tee not ready yet
     }
   }
 
@@ -248,6 +318,38 @@ FrameStats RtspClient::getStats(int id) const {
   return decoders_[id]->getStats();
 }
 
+// ---------------------------------------------------------------------------
+// WebRTC streaming API — per-stream, hot-switchable
+// ---------------------------------------------------------------------------
+
+bool RtspClient::start_streaming(int camera_id) {
+  if (camera_id < 0 || camera_id >= (int)decoders_.size())
+    return false;
+  return decoders_[camera_id]->start_streaming();
+}
+
+void RtspClient::stop_streaming(int camera_id) {
+  if (camera_id < 0 || camera_id >= (int)decoders_.size())
+    return;
+  decoders_[camera_id]->stop_streaming();
+}
+
+void RtspClient::start_streaming_all() {
+  for (auto& d : decoders_)
+    d->start_streaming();
+}
+
+void RtspClient::stop_streaming_all() {
+  for (auto& d : decoders_)
+    d->stop_streaming();
+}
+
+bool RtspClient::isWebRtcStreamingEnabled(int camera_id) const {
+  if (camera_id < 0 || camera_id >= (int)decoders_.size())
+    return false;
+  return decoders_[camera_id]->isWebRtcStreamingEnabled();
+}
+
 void RtspClient::reconnectLoop() {
   int current_delay_sec = DEFAULT_RECONNECT_DELAY_SEC;
   std::vector<int> retry_counts(decoders_.size(), 0);
@@ -281,7 +383,7 @@ void RtspClient::reconnectLoop() {
     bool any_attempted = false;
     for (size_t idx = 0; idx < decoders_.size(); ++idx) {
       auto &d = decoders_[idx];
-      if (d->hasError() || d->isStale(10)) {
+      if (d->hasError() || (!d->isFileSource() && d->isStale(10))) {
         // Check retry limit (0 = unlimited)
         if (retry_max_attempts_ > 0 && retry_counts[idx] >= retry_max_attempts_) {
           continue;  // Skip this stream, max retries reached
@@ -329,6 +431,12 @@ CpuBufferInfo RtspClient::getCpuBufferInfo(int id) const {
   if (id < 0 || id >= (int)decoders_.size())
     return CpuBufferInfo{};
   return decoders_[id]->getCpuBufferInfo();
+}
+
+std::vector<CpuFrame> RtspClient::getCpuFrames(int id, int count, int timeout_ms) {
+  if (id < 0 || id >= (int)decoders_.size())
+    return {};
+  return decoders_[id]->getCpuFrames(count, timeout_ms);
 }
 
 // Batch Frame Retrieval Implementation (Pre-allocated Buffer + Parallel Copy)

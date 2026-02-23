@@ -1,10 +1,9 @@
-
 import sys
 import os
 import time
 import threading
 import queue
-import cv2
+import signal
 import numpy as np
 import yaml
 import hashlib
@@ -17,7 +16,7 @@ from trt_detector import DetectorService, ModelConfig
 # Try to import RTSPModule
 RTSP_MODULE_AVAILABLE = False
 try:
-    sys.path.insert(0, 'RTSPModule-main/src')
+    sys.path.insert(0, 'RTSPModule-main/src')  # Using fixed new module with WebRTC + MP4 support
     import rtspmodule
     RTSP_MODULE_AVAILABLE = True
 except ImportError as e:
@@ -26,136 +25,24 @@ except ImportError as e:
     print("         See docstring for GStreamer installation instructions.\n")
 
 
-def calculate_grid_layout(num_streams, max_width=1920, max_height=1080):
-    """Calculate optimal grid layout for any number of streams"""
-    import math
-
-    if num_streams == 0:
-        return 1, 1, 640, 360
-
-    # Calculate grid dimensions (prefer wider layouts)
-    cols = math.ceil(math.sqrt(num_streams))
-    rows = math.ceil(num_streams / cols)
-
-    # Calculate cell size to fit within max dimensions
-    cell_w = max_width // cols
-    cell_h = max_height // rows
-
-    # Maintain 16:9 aspect ratio
-    if cell_w / cell_h > 16/9:
-        cell_w = int(cell_h * 16 / 9)
-    else:
-        cell_h = int(cell_w * 9 / 16)
-
-    return rows, cols, cell_w, cell_h
-
-
-class DisplayThread:
-    """Separate thread for display - handles resize and drawing (Fix #2)"""
-    def __init__(self, num_streams):
-        self.queue = queue.Queue(maxsize=2)
-        self.running = True
-        self.num_streams = num_streams
-        self.rows, self.cols, self.cell_w, self.cell_h = calculate_grid_layout(num_streams)
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
-
-    def _run(self):
-        while self.running:
-            try:
-                frame_data, stats = self.queue.get(timeout=0.1)
-
-                # Create grid
-                grid_h = self.cell_h * self.rows
-                grid_w = self.cell_w * self.cols
-                grid = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
-
-                for i, data in enumerate(frame_data):
-                    if data is None:
-                        continue
-
-                    frame, detections = data
-                    if frame is None:
-                        continue
-
-                    # OPTIMIZATION: Use INTER_LINEAR instead of INTER_NEAREST for better quality
-                    # INTER_LINEAR is faster than INTER_CUBIC and looks better than INTER_NEAREST
-                    disp = cv2.resize(frame, (self.cell_w, self.cell_h),
-                                     interpolation=cv2.INTER_LINEAR)
-
-                    # Draw detections with scaling
-                    scale_x = self.cell_w / frame.shape[1]
-                    scale_y = self.cell_h / frame.shape[0]
-                    for det in detections:
-                        x1 = int(det.x * scale_x)
-                        y1 = int(det.y * scale_y)
-                        x2 = int((det.x + det.width) * scale_x)
-                        y2 = int((det.y + det.height) * scale_y)
-                        cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 165, 255), 1)
-                        label = f"{det.label} {det.confidence:.2f}"
-                        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
-                        cv2.rectangle(disp, (x1, y1 - th - 4), (x1 + tw + 4, y1), (0, 255, 0), -1)
-                        cv2.putText(disp, label, (x1 + 2, y1 - 3), cv2.FONT_HERSHEY_SIMPLEX,
-                                   0.35, (0, 0, 0), 1, cv2.LINE_AA)
-
-                    # Add stream label
-                    cv2.putText(disp, f"Stream {i}", (5, 15),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-
-                    r, c = i // self.cols, i % self.cols
-                    y1, y2 = r * self.cell_h, (r + 1) * self.cell_h
-                    x1, x2 = c * self.cell_w, (c + 1) * self.cell_w
-                    grid[y1:y2, x1:x2] = disp
-
-                # Add stats bar at bottom
-                cv2.putText(grid, stats, (10, grid_h - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-                cv2.imshow("Multi-Stream Detection", grid)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    self.running = False
-            except queue.Empty:
-                continue
-
-    def show(self, frame_data, stats):
-        """frame_data is list of (frame, detections) tuples"""
-        try:
-            self.queue.put_nowait((frame_data, stats))
-        except queue.Full:
-            pass
-
-    def stop(self):
-        self.running = False
-        cv2.destroyAllWindows()
-
-
-def draw_detections_scaled(frame, detections, scale_x, scale_y):
-    """Draw detection boxes with scaling"""
-    for det in detections:
-        x1 = int(det.x * scale_x)
-        y1 = int(det.y * scale_y)
-        x2 = int((det.x + det.width) * scale_x)
-        y2 = int((det.y + det.height) * scale_y)
-        
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 1)
-        label = f"{det.label} {det.confidence:.2f}"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
-        cv2.rectangle(frame, (x1, y1 - th - 4), (x1 + tw + 4, y1), (0, 255, 0), -1)
-        cv2.putText(frame, label, (x1 + 2, y1 - 3), cv2.FONT_HERSHEY_SIMPLEX, 
-                   0.35, (0, 0, 0), 1, cv2.LINE_AA)
-    return frame
+# DisplayThread and visualization code removed - headless mode only
 
 
 def generate_rtsp_config(streams, output_path):
-    """Generate RTSPModule config from main config streams."""
+    """Generate RTSPModule config from main config streams.
+
+    NEW MODULE: Supports both RTSP streams and MP4 files:
+    - RTSP: source starts with rtsp:// → use 'url' field
+    - MP4: source is a file path → use 'file' field with 'loop: true'
+    """
     rtsp_config = {
         'settings': {
             'buffer_size': 8,  # OPTIMIZATION: Increased from 3 to 8 for better buffering
-            'retry_max_attempts': -1,  # -1 = infinite retries (loop videos)
+            'retry_max_attempts': 0,  # 0 = no retries (MP4 files don't need reconnection)
             'backoff_multiplier': 2,
             'gpu_id': 0,
             'log_base_path': './logs',
-            'cpu_buffer_enabled': True,
+            'cpu_buffer_enabled': True,  # Zero-copy not available - use CPU buffer
             'cpu_buffer_duration_sec': 3.0,  # OPTIMIZATION: Increased from 2.0 to 3.0
             'output_format': 'NV12',
             'decoder_preference': 'auto'
@@ -164,15 +51,28 @@ def generate_rtsp_config(streams, output_path):
     }
 
     for stream in streams:
-        # Convert relative paths to absolute
         source = stream['source']
-        if not source.startswith(('rtsp://', 'http://', 'file://', '/')):
-            source = os.path.abspath(source)
+        stream_name = stream.get('name', f"Stream {stream.get('id', len(rtsp_config['streams']))}")
 
-        rtsp_config['streams'].append({
-            'name': stream.get('name', f"Stream {stream.get('id', len(rtsp_config['streams']))}"),
-            'url': source
-        })
+        # Check if source is RTSP or file
+        if source.startswith(('rtsp://', 'http://', 'https://')):
+            # RTSP stream - use 'url' field
+            rtsp_config['streams'].append({
+                'name': stream_name,
+                'url': source
+            })
+        else:
+            # MP4 file - use 'file' field with loop and FPS cap
+            # Convert relative paths to absolute
+            if not source.startswith('/'):
+                source = os.path.abspath(source)
+
+            rtsp_config['streams'].append({
+                'name': stream_name,
+                'file': source,
+                'loop': True,  # Loop video files for continuous streaming
+                'fps': 30      # Cap at 30 FPS for smooth, controlled playback
+            })
 
     with open(output_path, 'w') as f:
         yaml.dump(rtsp_config, f, default_flow_style=False)
@@ -258,16 +158,14 @@ def main():
     # Determine which detection path to use
     use_zero_copy = not cpu_buffer_mode and rtsp.is_gpu_available()
     print(f"\n[3] Detection mode: {'ZERO-COPY GPU' if use_zero_copy else 'CPU BUFFER'}")
-    print("\nPress 'q' to quit")
+    print("\nPress Ctrl+C to quit")
     print("=" * 60)
 
-    # OPTIMIZATION: 3-stage async pipeline with queues
+    # OPTIMIZATION: 2-stage async pipeline with queues
     # Stage 1: Capture thread → capture_queue
-    # Stage 2: Inference thread (main) → inference_queue
-    # Stage 3: Display thread (existing) reads from last_frame_data
+    # Stage 2: Inference thread (main) - headless mode, no display
 
     capture_queue = queue.Queue(maxsize=2)  # Small queue to prevent memory buildup
-    inference_queue = queue.Queue(maxsize=2)
 
     # Timing stats
     inference_times = deque(maxlen=60)
@@ -281,21 +179,18 @@ def main():
     stream_latencies = [deque(maxlen=30) for _ in range(num_streams)]
     stream_frame_times = [time.time()] * num_streams
 
-    # Display frame skip (from config)
-    display_config = config.get('display', {})
-    frame_skip = display_config.get('frame_skip', 1)
-    display_frame_counter = 0
-    print(f"    Display frame skip: {frame_skip} (show every {frame_skip} frame(s))")
-
     # Camera IDs to fetch (all streams, up to max batch size)
     camera_ids = list(range(min(num_streams, max_batch)))
 
-    # Start display thread with dynamic grid for all streams
-    display_thread = DisplayThread(num_streams)
+    # Signal handler for graceful shutdown
+    shutdown_requested = threading.Event()
 
-    # Keep track of last valid frames + detections for display
-    # Format: (frame, detections) tuples - display thread handles resize/draw
-    last_frame_data = [None] * num_streams
+    def signal_handler(sig, frame):
+        print("\n\n[INFO] Shutdown signal received, stopping...")
+        shutdown_requested.set()
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     # Capture thread - runs independently
     capture_running = threading.Event()
@@ -373,7 +268,7 @@ def main():
     print(f"    Started async capture pipeline")
 
     try:
-        while display_thread.running:
+        while not shutdown_requested.is_set():
             # === INFERENCE STAGE - Consume from capture queue ===
             try:
                 capture_data = capture_queue.get(timeout=0.01)
@@ -392,7 +287,7 @@ def main():
                 batch_results = detector.detect_batch_gpu_nv12(gpu_ptrs, widths, heights)
                 inference_times.append((time.time() - t0) * 1000)
 
-                # Store results (no display frames in zero-copy mode)
+                # Store results (headless mode - no display)
                 for idx, detections in zip(valid_indices, batch_results):
                     last_detections[idx] = detections
                     # Track per-stream latency
@@ -400,11 +295,6 @@ def main():
                     stream_latency = (now - stream_frame_times[idx]) * 1000
                     stream_latencies[idx].append(stream_latency)
                     stream_frame_times[idx] = now
-                    # Create placeholder for display
-                    placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(placeholder, f"Cam {idx} (GPU Zero-Copy)", (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    last_frame_data[idx] = (placeholder, detections)
 
                 frame_counter += len(gpu_ptrs)
 
@@ -446,32 +336,24 @@ def main():
                 if nv12_frames:
                     # Direct NV12 to GPU - skip CPU color conversion!
                     batch_results = detector.detect_batch_nv12(nv12_frames, frame_width, frame_height)
-
-                    # Convert NV12 to BGR for display (off the critical path)
-                    display_bgr_frames = []
-                    for nv12_frame in nv12_frames:
-                        bgr = cv2.cvtColor(nv12_frame, cv2.COLOR_YUV2BGR_NV12)
-                        display_bgr_frames.append(bgr)
                 else:
                     # Fallback to BGR path
                     batch_results = detector.detect_batch(bgr_frames)
-                    display_bgr_frames = bgr_frames
 
                 inference_times.append((time.time() - t0) * 1000)
 
-                # Store results
-                for i, (idx, detections) in enumerate(zip(valid_indices, batch_results)):
+                # Store results (headless mode - no display)
+                for idx, detections in zip(valid_indices, batch_results):
                     last_detections[idx] = detections
                     # Track per-stream latency
                     now = time.time()
                     stream_latency = (now - stream_frame_times[idx]) * 1000
                     stream_latencies[idx].append(stream_latency)
                     stream_frame_times[idx] = now
-                    last_frame_data[idx] = (display_bgr_frames[i], detections)
 
                 frame_counter += len(valid_indices)
 
-            # === STATS ===
+            # === STATS - Print to console only ===
             elapsed_total = time.time() - fps_start_time
             avg_inference = sum(inference_times) / len(inference_times) if inference_times else 0
             avg_capture = sum(capture_times) / len(capture_times) if capture_times else 0
@@ -492,37 +374,41 @@ def main():
                 fps_start_time = time.time()
                 per_stream_fps = current_fps / len(camera_ids) if camera_ids else 0
 
-                # OPTIMIZATION: Enhanced performance stats with per-stream latency
+                # Enhanced performance stats with per-stream latency (console only)
                 mode = 'GPU Zero-Copy' if use_zero_copy else 'NV12 Direct'
                 total_latency = avg_capture + avg_inference
                 gpu_util_estimate = (avg_inference / 16.6) * 100  # % of 60Hz frame time
+
+                # Count total detections across all streams
+                total_detections = sum(len(dets) for dets in last_detections)
+
+                # Sample detections from first stream for verification
+                stream0_dets = last_detections[0] if last_detections and len(last_detections[0]) > 0 else []
+                det_sample = ""
+                if stream0_dets:
+                    # Show first 3 detections from stream 0
+                    samples = stream0_dets[:3]
+                    det_sample = " | Detections: " + ", ".join([f"{d.label}:{d.confidence:.2f}" for d in samples])
+                    if len(stream0_dets) > 3:
+                        det_sample += f" (+{len(stream0_dets)-3} more)"
+
                 print(f"\r[PERF] FPS: {current_fps:.1f} total | {per_stream_fps:.1f}/stream | "
                       f"Inf: {avg_inference:.1f}ms | Cap: {avg_capture:.1f}ms | "
                       f"Latency: {total_latency:.1f}ms | Stream Lat: {avg_stream_latency:.1f}ms "
                       f"(min:{min_stream_latency:.1f} max:{max_stream_latency:.1f}) | "
-                      f"GPU~{gpu_util_estimate:.0f}% | Mode: {mode}   ", end='', flush=True)
-
-            # === DISPLAY (with frame skip) ===
-            display_frame_counter += 1
-            if display_frame_counter >= frame_skip:
-                display_frame_counter = 0
-                # Send frame data to display thread (handles resize + drawing)
-                stats = (f"FPS: {current_fps:.1f} total | {per_stream_fps:.1f}/stream | "
-                        f"Inf: {avg_inference:.1f}ms | Cap: {avg_capture:.1f}ms | "
-                        f"Mode: {'GPU' if use_zero_copy else 'NV12'}")
-                display_thread.show(last_frame_data, stats)
+                      f"GPU~{gpu_util_estimate:.0f}% | Mode: {mode} | Total Dets: {total_detections}{det_sample}   ", end='', flush=True)
 
     except KeyboardInterrupt:
-        print("\nStopping...")
+        print("\n\n[INFO] Keyboard interrupt received")
     finally:
         # Stop capture thread
         capture_running.clear()
         if capture_thread.is_alive():
             capture_thread.join(timeout=1.0)
 
-        display_thread.stop()
+        # Cleanup
         rtsp.stop()
-        print("Done.")
+        print("\n[INFO] Cleanup complete. Exiting.")
 
 
 if __name__ == "__main__":

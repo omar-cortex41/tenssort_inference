@@ -42,3 +42,10 @@ lib/
 /*.pt
 /*.onnx
 /*.engine
+
+#others
+/*.mp4
+/*.csv
+# Rust Build Artifacts and Cache
+gst-webrtcrs/target/
+gst-webrtcrs/.cargo_home/

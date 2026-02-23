@@ -56,6 +56,22 @@ docker build -f docker/Dockerfile.deepstream -t rtsp_module_deepstream .
 docker build -f docker/Dockerfile.apt -t rtsp_module_apt .
 ```
 
+### Option 5: PyTorch & DeepStream
+**Best for:** Deep learning pipelines requiring both PyTorch and standard DeepStream 7.1 features.
+
+Combines the PyTorch 2.6 runtime with strict DeepStream 7.1 installation.
+
+```bash
+docker build -f docker/Dockerfile.pytorch_deepstream -t rtsp_module_pytorch_deepstream .
+```
+
+#### Export Build
+Extracts the compiled wheels for **Python 3.9, 3.10, 3.11, and 3.12** for local usage.
+
+```bash
+DOCKER_BUILDKIT=1 docker build --target export --output type=local,dest=./wheels/deepstream . -f docker/Dockerfile.pytorch_deepstream
+```
+
 ---
 
 ## Run the Container
@@ -77,8 +93,16 @@ docker run --rm -it \
 
 ### Explanation of Flags
 
--   `--net=host`: Uses the host's network stack. This is **required** for low-latency RTSP streaming and proper functionality of some network protocols.
+-   `--net=host`: Uses the host's network stack. This is **required** for low-latency RTSP streaming and proper functionality of some network protocols, including WebRTC signaling.
 -   `--gpus all`: Exposes all NVIDIA GPUs to the container.
 -   `-e DISPLAY=$DISPLAY` & `-v /tmp/.X11-unix...`: Enables GUI applications (like OpenCV `imshow` or GStreamer `autovideosink`) to render on the host display.
 -   `-v .../config.yaml`: Mounts your local configuration file into the workspace.
 -   `-v .../output`: Mounts the output directory for recordings or logs.
+
+---
+
+### WebRTC Requirements
+
+If you have enabled WebRTC streaming in your configuration (`webrtc_enabled: true`), using `--net=host` is the easiest way to ensure the WebRTC signaling server (default port `9000`) and the dynamically allocated ICE UDP ports are reachable from the host.
+
+If you cannot use `--net=host`, you must explicitly map the signaling port and the required UDP port range for ICE negotiation. However, due to the dynamic nature of WebRTC UDP ports, `--net=host` is strongly recommended for Docker deployments.

@@ -55,6 +55,9 @@ add_library(RTSPCore STATIC
     src/core/rtsp_client.cpp
     src/core/stream_decoder.cpp
     src/core/cpu_buffer.cpp
+    src/core/webrtc_sink_bin.cpp
+    src/core/stream_pipeline_builder.cpp
+    src/core/buffer_mapper.cpp
 )
 
 target_link_libraries(RTSPCore PRIVATE
@@ -108,4 +111,28 @@ foreach(DS_PATH ${DEEPSTREAM_PATHS})
     endif()
 endforeach()
 
+# -------------------------------------------------------------------------------
+# gst-webrtcrs Rust Plugin
+# -------------------------------------------------------------------------------
+find_program(CARGO cargo)
 
+if(CARGO)
+    set(WEBRTC_SRC_DIR  ${CMAKE_SOURCE_DIR}/gst-webrtcrs)
+    set(WEBRTC_OUT_DIR  ${CMAKE_SOURCE_DIR}/lib)
+    set(WEBRTC_PLUGIN_LIB ${WEBRTC_OUT_DIR}/libgstwebrtcrs.so)
+
+    add_custom_command(
+        OUTPUT  ${WEBRTC_PLUGIN_LIB}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${WEBRTC_OUT_DIR}
+        COMMAND ${CARGO} build --release
+        COMMAND ${CMAKE_COMMAND} -E copy ${WEBRTC_SRC_DIR}/target/release/libgstwebrtcrs.so ${WEBRTC_PLUGIN_LIB}
+        WORKING_DIRECTORY ${WEBRTC_SRC_DIR}
+        COMMENT "[gst-webrtcrs] cargo build and copy to ./lib"
+        VERBATIM
+    )
+    add_custom_target(gst_webrtcrs ALL DEPENDS ${WEBRTC_PLUGIN_LIB})
+    add_dependencies(RTSPCore gst_webrtcrs)
+    message(STATUS "gst-webrtcrs: will build at ${WEBRTC_SRC_DIR} and copy to ${WEBRTC_OUT_DIR}")
+else()
+    message(WARNING "cargo not found - gst-webrtcrs Rust plugin will NOT be built")
+endif()

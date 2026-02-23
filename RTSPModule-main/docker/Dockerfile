@@ -31,8 +31,12 @@ RUN apt-get update && apt-get install -y \
     libavcodec-dev \
     libavformat-dev \
     libavutil-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install meson scikit-build-core pybind11 build
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 
 
@@ -106,10 +110,12 @@ RUN apt-get update && apt-get install -y \
 # Copy GStreamer and built wheel
 COPY --from=builder /opt/gst /opt/gst
 COPY --from=builder /working/wheels /wheels
+COPY --from=builder /working/app/lib /workspace/lib
 
 ENV PATH=/opt/gst/bin:/usr/local/cuda/bin:$PATH
 ENV LD_LIBRARY_PATH=/opt/gst/lib/x86_64-linux-gnu:/usr/local/cuda/lib64:/usr/local/cuda-12.8/targets/x86_64-linux/lib:$LD_LIBRARY_PATH
 ENV PKG_CONFIG_PATH=/opt/gst/lib/x86_64-linux-gnu/pkgconfig
+ENV GST_PLUGIN_PATH=/opt/gst/lib/x86_64-linux-gnu/gstreamer-1.0:/workspace/lib
 
 # Install rtspmodule from wheel + runtime dependencies
 RUN pip3 install --no-cache-dir /wheels/*.whl \

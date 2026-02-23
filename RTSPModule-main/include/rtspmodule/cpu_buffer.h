@@ -30,6 +30,10 @@ public:
   // timeout_ms: 0 = non-blocking (returns empty if no frames), >0 = wait up to timeout
   CpuFrame get(int timeout_ms = 0);
   
+  // Get multiple frames from head (FIFO order, oldest first)
+  // Returns up to 'count' frames. Waits up to timeout_ms for at least 1 frame.
+  std::vector<CpuFrame> getMulti(int count, int timeout_ms = 0);
+  
   // Clear buffer and release all memory
   void clear();
   

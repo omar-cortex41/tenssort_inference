@@ -48,10 +48,12 @@ RUN apt-get update && apt-get install -y \
 # Note: The context is expected to contain 'gst' and 'wheels' folders
 COPY gst /opt/gst
 COPY wheels /wheels
+COPY lib /workspace/lib
 
 ENV PATH=/opt/gst/bin:/usr/local/cuda/bin:$PATH
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/gst/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/opt/conda/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:$LD_LIBRARY_PATH
 ENV PKG_CONFIG_PATH=/opt/gst/lib/x86_64-linux-gnu/pkgconfig
+ENV GST_PLUGIN_PATH=/opt/gst/lib/x86_64-linux-gnu/gstreamer-1.0:/workspace/lib
 
 WORKDIR /workspace
 

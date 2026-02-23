@@ -30,8 +30,12 @@ RUN apt-get update && apt-get install -y \
     gstreamer1.0-gtk3 \
     gstreamer1.0-qt5 \
     gstreamer1.0-pulseaudio \
+    curl \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install scikit-build-core pybind11 build
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /working/app
 COPY . .
@@ -68,9 +72,11 @@ RUN apt-get update && apt-get install -y \
 
 # Copy built wheel
 COPY --from=builder /working/wheels /wheels
+COPY --from=builder /working/app/lib /workspace/lib
 
 # CUDA Lib paths - leveraging the PyTorch environment
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:/opt/conda/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:$LD_LIBRARY_PATH
+ENV GST_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/gstreamer-1.0:/workspace/lib
 
 WORKDIR /workspace
 

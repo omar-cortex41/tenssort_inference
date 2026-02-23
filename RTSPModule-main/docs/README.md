@@ -85,10 +85,17 @@ settings:
   decoder_preference: auto
 
 streams:
+  # RTSP streams
   - name: "Camera 1"
     url: rtsp://user:pass@192.168.1.10:554/stream
   - name: "Camera 2"
     url: rtsp://user:pass@192.168.1.11:554/stream
+    
+  # MP4 files with FPS-capped decoding
+  - name: "Demo Video"
+    file: /path/to/demo.mp4
+    loop: true
+    fps: 25
 ```
 
 | Setting | Default | Description |

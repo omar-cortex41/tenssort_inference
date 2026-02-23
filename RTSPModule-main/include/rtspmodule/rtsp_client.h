@@ -49,6 +49,7 @@ public:
 
   // CPU Buffer access (timeout_ms: 0=non-blocking, >0=wait for frame)
   CpuFrame getCpuFrame(int camera_id, int timeout_ms = 0);
+  std::vector<CpuFrame> getCpuFrames(int camera_id, int count, int timeout_ms = 0);
   CpuBufferInfo getCpuBufferInfo(int camera_id) const;
   bool isCpuBufferEnabled() const { 
       return cpu_buffer_enabled_ || StreamDecoder::global_gpu_failure_.load(); 
@@ -58,6 +59,16 @@ public:
   // Batch Frame Retrieval - get frames from multiple cameras in single call
   // Returns fixed-size batch with valid_mask indicating which frames succeeded
   FrameBatch getBatchedFrames(const BatchConfig& config);
+
+  // -------------------------------------------------------------------------
+  // WebRTC streaming control — fully independent per stream, hot-switchable
+  // -------------------------------------------------------------------------
+  bool start_streaming(int camera_id);   // Returns false if invalid id or already streaming
+  void stop_streaming(int camera_id);
+  void start_streaming_all();
+  void stop_streaming_all();
+  bool isWebRtcStreamingEnabled(int camera_id) const;
+  void setWebRtcBasePort(int base_port) { webrtc_base_port_ = base_port; }
 
 private:
   std::vector<std::unique_ptr<StreamDecoder>> decoders_;
@@ -82,11 +93,16 @@ private:
   double cpu_buffer_duration_sec_ = DEFAULT_CPU_BUFFER_DURATION;
   std::string output_format_ = "NV12";
   bool gpu_available_ = true;  // Set to false if CUDA context init fails
+  std::string decoder_preference_ = "auto";
   
   // Pre-allocated batch buffer (reused across getBatchedFrames calls)
   FrameBatch batch_buffer_;
   size_t batch_buffer_capacity_ = 0;  // Current allocated frame count
   size_t batch_buffer_stride_ = 0;    // Current bytes per frame
+  
+  // WebRTC settings
+  bool webrtc_autostart_ = false;  // Auto-start all streams on launch
+  int  webrtc_base_port_ = 9000;   // single signaling port for all streams
   
   // Thread pool for parallel batch copy (eliminates per-call thread spawn overhead)
   static constexpr size_t COPY_POOL_SIZE = 4;  // 4 workers is optimal for memcpy

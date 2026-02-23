@@ -17,26 +17,114 @@ settings:
   # nvv4l2 = Force DeepStream decoder (fails if unavailable)
   # nvdec = Force standard GStreamer NVDEC (nvh264dec/nvh265dec)
   # cpu = Force CPU decoding (avdec) for testing
-  decoder_preference: auto
+  decoder_preference: nvdec
 
-# Direct local video files (no RTSP overhead)
-# Supports: file:// URLs or direct paths
+  # WebRTC streaming (off by default, each stream independently controllable at runtime)
+  # All streams share a single signaling port, identified by stream_id (camera name, spaces → hyphens)
+  # Example: http://localhost:9000/webrtc/offer?stream_id=Camera-3
+  webrtc_enabled: true      # true = auto-start WebRTC on all streams at launch
+  webrtc_base_port: 9000     # Single signaling port for all streams
+
 streams:
-  - name: "Stream 1"
-    url: /home/omar/work/tenssort_inference/videos/vid1.mp4
-  - name: "Stream 2"
-    url: /home/omar/work/tenssort_inference/videos/vid2.mp4
-  - name: "Stream 3"
-    url: /home/omar/work/tenssort_inference/videos/vid3.mp4
-  - name: "Stream 4"
-    url: /home/omar/work/tenssort_inference/videos/vid4.mp4
-  - name: "Stream 5"
-    url: /home/omar/work/tenssort_inference/videos/vid5.mp4
-  - name: "Stream 6"
-    url: /home/omar/work/tenssort_inference/videos/vid6.mp4
-  - name: "Stream 7"
-    url: /home/omar/work/tenssort_inference/videos/vid7.mp4
-  - name: "Stream 8"
-    url: /home/omar/work/tenssort_inference/videos/vid8.mp4
- 
+  # - name: "Camera 1"
+  #   url: rtsp://admin:P%40ssw0rd@192.168.1.65:554
+  # # - name: "Camera 2"
+  # #   url: rtsp://127.0.0.1:8554/live
+  - name: "Camera 3"
+    url: rtsp://admin:P%40ssw0rd@192.168.1.64:554
+  - name: "Camera 4"
+    url: rtsp://admin:P%40ssw0rd@192.168.1.64:554
+  # - name: "Camera 5"
+  #   file: "test.mp4"
+  #   loop: true
+  #   fps: 30
+  # - name: "Camera 6"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 7"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 8"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 9"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 10"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 11"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 12"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 13"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 14"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 15"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 16"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 17"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 18"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 19"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 20"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 21"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 22"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 23"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 24"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 25"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 26"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 27"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 28"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 29"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 30"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 31"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 32"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 33"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 34"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 35"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 36"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 37"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 38"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 39"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 40"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 41"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # - name: "Camera 42"
+  #   url: rtsp://192.168.1.61:8554/cam1
+  # # # - name: "Camera 43"
+  # # #   url: rtsp://192.168.1.61:8554/cam1
+  # # # - name: "Camera 44"
+  # # #   url: rtsp://192.168.1.61:8554/cam1
+  # # # - name: "Camera 45"
+  # # #   url: rtsp://192.168.1.61:8554/cam1
+  # # # - name: "Camera 46"
+  # # #   url: rtsp://192.168.1.61:8554/cam1
+  # # # - name: "Camera 47"
+  # # #   url: rtsp://192.168.1.61:8554/cam1
+  # # # - name: "Camera 48"
+  # # #   url: rtsp://192.168.1.61:8554/cam1
+  # # # - name: "Camera 49"
+  # # #   url: rtsp://192.168.1.61:8554/cam1
+  # # # - name: "Camera 50"
   

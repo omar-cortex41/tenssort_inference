@@ -7,21 +7,37 @@ settings:
   gpu_id: 0
   log_base_path: ./logs
   output_format: NV12
-  retry_max_attempts: -1
+  retry_max_attempts: 0
 streams:
-- name: Stream 1
-  url: /home/omar/work/tenssort_inference/videos/vid5.mp4
-- name: Stream 2
-  url: /home/omar/work/tenssort_inference/videos/vid5.mp4
-- name: Stream 3
-  url: /home/omar/work/tenssort_inference/videos/vid5.mp4
-- name: Stream 4
-  url: /home/omar/work/tenssort_inference/videos/vid5.mp4
-- name: Stream 5
-  url: /home/omar/work/tenssort_inference/videos/vid5.mp4
-- name: Stream 6
-  url: /home/omar/work/tenssort_inference/videos/vid5.mp4
-- name: Stream 7
-  url: /home/omar/work/tenssort_inference/videos/vid5.mp4
-- name: Stream 8
-  url: /home/omar/work/tenssort_inference/videos/vid5.mp4
+- file: /home/omar/work/tenssort_inference/tenssort_inference/videos/vid5.mp4
+  fps: 30
+  loop: true
+  name: Stream 1
+- file: /home/omar/work/tenssort_inference/tenssort_inference/videos/vid5.mp4
+  fps: 30
+  loop: true
+  name: Stream 2
+- file: /home/omar/work/tenssort_inference/tenssort_inference/videos/vid5.mp4
+  fps: 30
+  loop: true
+  name: Stream 3
+- file: /home/omar/work/tenssort_inference/tenssort_inference/videos/vid5.mp4
+  fps: 30
+  loop: true
+  name: Stream 4
+- file: /home/omar/work/tenssort_inference/tenssort_inference/videos/vid5.mp4
+  fps: 30
+  loop: true
+  name: Stream 5
+- file: /home/omar/work/tenssort_inference/tenssort_inference/videos/vid5.mp4
+  fps: 30
+  loop: true
+  name: Stream 6
+- file: /home/omar/work/tenssort_inference/tenssort_inference/videos/vid5.mp4
+  fps: 30
+  loop: true
+  name: Stream 7
+- file: /home/omar/work/tenssort_inference/tenssort_inference/videos/vid5.mp4
+  fps: 30
+  loop: true
+  name: Stream 8

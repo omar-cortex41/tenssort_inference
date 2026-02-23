@@ -20,8 +20,30 @@ echo ""
 rm -rf "$OUTPUT_DIR"/*.whl 2>/dev/null || true
 mkdir -p "$OUTPUT_DIR"
 
-# Source conda
-source ~/miniconda3/etc/profile.d/conda.sh
+# Auto-detect and source conda
+if command -v conda &> /dev/null; then
+    # Detect from binary path (e.g., .../bin/conda -> ...)
+    CONDA_BASE=$(dirname $(dirname "$(command -v conda)"))
+    if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+        source "$CONDA_BASE/etc/profile.d/conda.sh"
+    else
+        echo "Warning: conda executable found but profile script not at $CONDA_BASE/etc/profile.d/conda.sh"
+    fi
+fi
+
+# Fallback to standard locations if not yet sourced or detected
+if [ -z "$CONDA_PREFIX" ] && [ -z "$CONDA_EXE" ]; then
+    if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+        source "$HOME/miniconda3/etc/profile.d/conda.sh"
+    elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+        source "$HOME/anaconda3/etc/profile.d/conda.sh"
+    elif [ -f "/opt/conda/etc/profile.d/conda.sh" ]; then
+        source "/opt/conda/etc/profile.d/conda.sh"
+    else
+        echo "Error: Conda not found. Please ensure conda is in your PATH or installed in standard locations."
+        exit 1
+    fi
+fi
 
 for PY_VER in "${PYTHON_VERSIONS[@]}"; do
     ENV_NAME="wheel_py${PY_VER//./}"
