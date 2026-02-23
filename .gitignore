@@ -209,3 +209,9 @@ __marimo__/
 ./models/
 ./videos/
 ./logs/
+
+# Excluded Directories
+models/
+videos/
+.agent/
+.claude/
